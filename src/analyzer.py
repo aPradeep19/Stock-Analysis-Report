@@ -60,7 +60,8 @@ class QuantitativeAnalyzer:
     def analyze(self, pipeline_data: dict) -> dict:
         """
         Evaluates the entire watchlist against the configuration thresholds.
-        Returns a dictionary containing ONLY the tickers that triggered an alert.
+        Returns a dictionary containing all analysis. Trigger logic commented out
+        for future updates.
         """
         flagged_tickers = {}
 
