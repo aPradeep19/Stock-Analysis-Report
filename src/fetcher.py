@@ -8,6 +8,7 @@ class FinnhubFetcher:
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.base_url = "https://finnhub.io/api/v1"
+        # Finnhub expects token authentication passed via the custom X-Finnhub-Token header
         self.headers = {"X-Finnhub-Token": self.api_key}
 
     def _get(self, endpoint: str, params: dict = None) -> dict:
@@ -26,7 +27,15 @@ class FinnhubFetcher:
         return response.json()
 
     def get_quote(self, symbol: str) -> dict:
-        """Fetches real-time/latest end-of-day quote data."""
+        """
+        Retrieves real-time/latest end-of-day price action.
+        
+        Finnhub keys:
+          'c': Current close/last price
+          'd': Dollar change
+          'dp': Percentage change
+          'h': Daily High, 'l': Daily Low, 'o': Daily Open, 'pc': Previous Close
+        """
         
         data = self._get("/quote", {"symbol": symbol})
         return {
@@ -39,8 +48,15 @@ class FinnhubFetcher:
             "prev_close": data.get("pc")
         }
 
-    def get_historical_candles(self, symbol: str, days_back: int = 60) -> pd.DataFrame:
-        """Fetches daily OHLCV data for technical analysis (MAs, RSI, Volume)."""
+    def get_historical_candles(self, symbol: str, days_back: int = 90) -> pd.DataFrame:
+        """
+        Fetches daily OHLCV bars converted into a clean Datetime-indexed pandas DataFrame.
+        
+        Lookback Window Logic:
+        We set the default to 90 calendar days (~62 trading sessions). A standard 50-day 
+        Simple Moving Average requires a minimum of 50 valid data points. Setting days_back
+        to 90 ensures the rolling window calculation will not return NaN values.
+        """
 
         end_time = int(time.time())
         start_time = int((datetime.now() - timedelta(days=days_back)).timestamp())
@@ -52,9 +68,11 @@ class FinnhubFetcher:
             "to": end_time
         })
         
+        # Check API status flag; 'no_data' or empty returns result in an empty DataFrame
         if data.get("s") != "ok":
             return pd.DataFrame()
-            
+        
+        # Construct DataFrame and normalize Finnhub's abbreviated single-letter keys
         df = pd.DataFrame({
             "date": pd.to_datetime(data["t"], unit="s"),
             "open": data["o"],
@@ -65,10 +83,13 @@ class FinnhubFetcher:
         })
 
         # Set datetime index for easy integration with the 'ta' library later
-        return df.set_index("date")
+        return df.set_index("date").sort_index()
 
     def get_recent_news(self, symbol: str, days_back: int = 3) -> list:
-        """Fetches recent company news catalysts."""
+        """
+        Pulls recent company-specific headlines and links to serve as catalysts.
+        
+        """
 
         end_date = datetime.now().strftime("%Y-%m-%d")
         start_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
