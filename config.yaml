@@ -1,0 +1,12 @@
+watchlist:
+  - AAPL
+  - NBIS
+  - MRVL
+  - NVDA
+  - SNDK
+
+analysis_thresholds:
+  price_change_pct: 5.0
+  volume_surge_multiplier: 2.0
+  rsi_oversold: 30
+  rsi_overbought: 70
