@@ -17,8 +17,6 @@ class QuantitativeAnalyzer:
         Applies standard quantitative indicators to the historical DataFrame.
         Requires at least 20 days of data for the SMA and 14 days for the RSI.
         """
-        if df.empty or len(df) < 20:
-            return df
 
         # 1. 20-Day Simple Moving Average of Volume
         df['vol_sma_20'] = df['volume'].rolling(window=20).mean()
@@ -26,6 +24,11 @@ class QuantitativeAnalyzer:
         # 2. 14-Period Relative Strength Index (RSI)
         rsi_indicator = RSIIndicator(close=df['close'], window=14)
         df['rsi_14'] = rsi_indicator.rsi()
+
+        # 3. Price Moving Averages
+        df['sma_20'] = df['close'].rolling(window=20).mean()
+        df['sma_50'] = df['close'].rolling(window=50).mean()
+        df['sma_200'] = df['close'].rolling(window=200).mean()
 
         return df
 
@@ -111,6 +114,31 @@ class QuantitativeAnalyzer:
                     triggers.append(f"Bearish/weak momentum (14 day RSI: {current_rsi:.1f})")
                 elif current_rsi < self.rsi_oversold:
                     triggers.append(f"Potentially oversold (14 day RSI: {current_rsi:.1f})")
+
+            # Price vs Moving Averages
+            current_price = latest_bar['close']
+
+            sma_20 = latest_bar['sma_20']
+            sma_50 = latest_bar['sma_50']
+            sma_200 = latest_bar['sma_200']
+
+            if pd.notna(sma_20):
+                if current_price > sma_20:
+                    triggers.append(f"Price above 20-day average (${sma_20:.2f})")
+                else:
+                    triggers.append(f"Price below 20-day average (${sma_20:.2f})")
+
+            if pd.notna(sma_50):
+                if current_price > sma_50:
+                    triggers.append(f"Price above 50-day average (${sma_50:.2f})")
+                else:
+                    triggers.append(f"Price below 50-day average (${sma_50:.2f})")
+
+            if pd.notna(sma_200):
+                if current_price > sma_200:
+                    triggers.append(f"Price above 200-day average (${sma_200:.2f})")
+                else:
+                    triggers.append(f"Price below 200-day average (${sma_200:.2f})")
                 
 
             # Only flag the ticker if it breached at least one threshold

@@ -40,9 +40,7 @@ def main():
         print(f"--> Fetching market data for: {symbol}")
         
         quote = fetcher.get_quote(symbol)
-        
-        # 90 calendar days guarantees adequate data points for 20-day and 50-day technical indicators
-        candles = fetcher.get_historical_candles(symbol, days_back=90)
+        candles = fetcher.get_historical_candles(symbol, days_back=300)
         news = fetcher.get_recent_news(symbol, days_back=3)
 
         pipeline_data[symbol] = {
