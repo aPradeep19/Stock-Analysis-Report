@@ -10,6 +10,7 @@ class QuantitativeAnalyzer:
         self.vol_multiplier = self.thresholds.get("volume_surge_multiplier", 2.0)
         self.rsi_oversold = self.thresholds.get("rsi_oversold", 30)
         self.rsi_overbought = self.thresholds.get("rsi_overbought", 70)
+        self.rsi_bullish = self.thresholds.get("rsi_bullish", 50)
 
     def _compute_technicals(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -102,10 +103,15 @@ class QuantitativeAnalyzer:
             current_rsi = latest_bar['rsi_14']
             # if pd.notna(current_rsi):
             if True:
-                if current_rsi <= self.rsi_oversold:
-                    triggers.append(f"Oversold (RSI: {current_rsi:.1f})")
-                elif current_rsi >= self.rsi_overbought:
-                    triggers.append(f"Overbought (RSI: {current_rsi:.1f})")
+                if current_rsi > self.rsi_overbought:
+                    triggers.append(f"Potentially overbought (14 day RSI: {current_rsi:.1f})")
+                elif current_rsi >= 50:
+                    triggers.append(f"Bullish momentum (14 day RSI: {current_rsi:.1f})")
+                elif current_rsi >= self.rsi_oversold:
+                    triggers.append(f"Bearish/weak momentum (14 day RSI: {current_rsi:.1f})")
+                elif current_rsi < self.rsi_oversold:
+                    triggers.append(f"Potentially oversold (14 day RSI: {current_rsi:.1f})")
+                
 
             # Only flag the ticker if it breached at least one threshold
             if triggers:
