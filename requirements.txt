@@ -3,3 +3,6 @@ PyYAML
 yfinance
 pandas
 ta
+matplotlib
+reportlab
+pypdf

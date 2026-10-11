@@ -1,0 +1,100 @@
+name: Pre-Market Report
+
+on:
+  schedule:
+    # Target: email lands at 7:00 AM Central (8:00 AM New York), Monday to Friday.
+    # GitHub runs cron in UTC and doesn't adjust for daylight saving time.
+    # 6:45 AM Central = 11:45 UTC in summer (CDT) and 12:45 UTC in winter (CST).
+    # Both are scheduled; the "gate" job lets through only the one that matches today's clock.
+    # Starting at 6:45 absorbs GitHub's usual 5-15 minute delay (worse on the hour); the
+    # "Wait until 7:00 AM Central" step below holds the run so the email goes out at 7, not early.
+    - cron: "45 11 * * 1-5"
+    - cron: "45 12 * * 1-5"
+  workflow_dispatch:          # adds a "Run workflow" button on the Actions tab for manual runs
+    inputs:
+      dry_run:
+        description: "Build the report without emailing it"
+        type: boolean
+        default: false
+
+concurrency:
+  group: premarket-report     # never two reports at once
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - id: check
+        env:
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          ZONE=$(TZ=America/Chicago date +%Z)   # "CDT" in summer, "CST" in winter
+          if [ "$EVENT" != "schedule" ]; then
+            RUN=true
+          elif [ "$SCHEDULE" = "45 11 * * 1-5" ] && [ "$ZONE" = "CDT" ]; then
+            RUN=true
+          elif [ "$SCHEDULE" = "45 12 * * 1-5" ] && [ "$ZONE" = "CST" ]; then
+            RUN=true
+          else
+            RUN=false
+          fi
+          echo "event=$EVENT schedule='$SCHEDULE' chicago=$ZONE -> run=$RUN"
+          echo "run=$RUN" >> "$GITHUB_OUTPUT"
+
+  report:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Scheduled runs start ~6:45 AM Central; hold until 7:00 so the data is fresh and the email
+      # arrives on time. If GitHub started late (after 7:00), this doesn't wait at all.
+      # Manual runs ("Run workflow" button) skip the wait.
+      - name: Wait until 7:00 AM Central
+        if: github.event_name == 'schedule'
+        run: |
+          TARGET=$(TZ=America/Chicago date -d "07:00" +%s)
+          WAIT=$(( TARGET - $(date +%s) ))
+          if [ "$WAIT" -gt 0 ] && [ "$WAIT" -le 3600 ]; then
+            echo "Waiting ${WAIT}s until 7:00 AM Central"
+            sleep "$WAIT"
+          else
+            echo "Already past 7:00 AM Central (or >1h early); running now"
+          fi
+
+      - name: Build and send the report
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          RECIPIENT_EMAILS: ${{ secrets.RECIPIENT_EMAILS }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            python main.py --dry-run
+          else
+            python main.py
+          fi
+
+      # Keeps each day's HTML/PDF for 14 days under the run's "Artifacts" section
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: premarket-report-${{ github.run_id }}
+          path: output/
+          retention-days: 14
+          if-no-files-found: ignore

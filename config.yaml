@@ -1,15 +1,48 @@
+# Add stock symbol you want analysis for
 watchlist:
   - NBIS
   - MRVL
   - NVDA
   - SNDK
-  - NOK
+  - MU
   - SLS
   - RDDT
+  - RZLV
 
 analysis_thresholds:
-  price_change_pct: 5.0
-  volume_surge_multiplier: 2.0
+  # Price moves. A move alerts if it is at least this big AND a normal-sized move for the stock,
+  # OR if it's unusually big for that particular stock (see unusual_move_sigma).
+  price_change_pct: 5.0          # last regular session's close-to-close move
+  premarket_gap_pct: 3.0         # pre-market price vs. last close
+  unusual_move_sigma: 2.0        # ...or a move >= 2x the stock's typical daily move
+  min_move_pct: 1.5              # ...as long as it's at least 1.5% (ignores calm-stock wiggles)
+
+  volume_surge_multiplier: 2.0   # volume vs. the previous 20 sessions' average
   rsi_oversold: 30
   rsi_overbought: 70
   rsi_bullish: 50
+  near_52w_pct: 3.0              # "within 3% of the 52-week high/low" note
+  earnings_lookahead_days: 7     # warn about earnings this many days ahead
+
+  # Positioning (Yahoo). Each list splits values into levels; the report explains what each
+  # level means. Positioning alerts are minor (severity < 1): they show on the stock's own
+  # page, not in the header.
+  short_interest_levels_pct: [5, 10, 20]  # % of float: low / moderate / high / very high (alert)
+  days_to_cover_levels: [2, 5, 10]         # days: low / moderate / high / very high
+  put_call_levels: [0.5, 0.8, 1.2, 1.5]    # put/call open interest: very bullish (alert) / bullish /
+                                           #   neutral / cautious / bearish (alert)
+  options_window_days: 30          # count open interest for expirations this many days out
+  options_min_open_interest: 1000  # ignore the ratio on thinly traded option chains
+
+report:
+  title: "Pre-Market Brief"
+  header_min_severity: 1.0       # alerts below this stay on the stock's own page, not the header
+  news_per_stock: 3
+  attach_pdf: true
+
+market_movers:
+  enabled: true                  # "Outside your watchlist" section (Yahoo gainers/losers/most active)
+  count: 5
+
+# Secrets are NOT stored here. Set them as environment variables (locally) or GitHub Secrets:
+#   FINNHUB_API_KEY, SENDER_EMAIL, EMAIL_PASSWORD (Gmail App Password), RECIPIENT_EMAILS
