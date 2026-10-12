@@ -8,6 +8,9 @@ watchlist:
   - SLS
   - RDDT
   - RZLV
+  - NOW
+  - GOOGL
+  - GEV
 
 analysis_thresholds:
   # Price moves. A move alerts if it is at least this big AND a normal-sized move for the stock,
