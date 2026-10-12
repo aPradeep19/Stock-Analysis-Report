@@ -6,3 +6,4 @@ ta
 matplotlib
 reportlab
 pypdf
+pypdfium2
