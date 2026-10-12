@@ -17,6 +17,9 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: write             # lets the run push today's report to the "reports" branch
+
 concurrency:
   group: premarket-report     # never two reports at once
   cancel-in-progress: false
@@ -89,6 +92,29 @@ jobs:
           else
             python main.py
           fi
+
+      # The README shows reports/latest.png and links to reports/latest.pdf. The branch is rebuilt
+      # from scratch and force-pushed each day, so old PDFs don't pile up in the repo's history.
+      - name: Publish today's report to the reports branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PDF=$(ls output/*.pdf 2>/dev/null | head -n 1)
+          if [ -z "$PDF" ]; then
+            echo "No PDF was built today; leaving yesterday's report up"
+            exit 0
+          fi
+          DIR="$RUNNER_TEMP/reports"
+          mkdir -p "$DIR"
+          cp "$PDF" "$DIR/latest.pdf"
+          python -m src.preview "$PDF" "$DIR/latest.png"
+          cd "$DIR"
+          git init -q -b reports
+          git add latest.pdf latest.png
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "Report for $(TZ=America/Chicago date +%F)"
+          git push -q -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" reports
 
       # Keeps each day's HTML/PDF for 14 days under the run's "Artifacts" section
       - uses: actions/upload-artifact@v5

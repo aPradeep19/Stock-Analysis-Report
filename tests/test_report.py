@@ -85,18 +85,31 @@ class FormatterTests(unittest.TestCase):
 
 
 class PdfTests(unittest.TestCase):
-    def test_pdf_has_header_page_plus_one_page_per_stock(self):
+    def test_pdf_has_header_page_stock_pages_and_guide_page(self):
         from pypdf import PdfReader
         from src.pdf_report import NewsletterPDF
         formatter, ctx, pipeline = build_report()
         with tempfile.TemporaryDirectory() as tmp:
             path = NewsletterPDF(formatter).build(ctx, pipeline, os.path.join(tmp, "report.pdf"))
             reader = PdfReader(path)
-            self.assertGreaterEqual(len(reader.pages), 1 + len(ctx["stocks"]))
+            self.assertGreaterEqual(len(reader.pages), 2 + len(ctx["stocks"]))
             first_page = reader.pages[0].extract_text()
             self.assertIn("Big & concerning moves", first_page)
-            last_page = reader.pages[-1].extract_text()
-            self.assertIn(ctx["stocks"][-1]["symbol"], last_page)
+            self.assertNotIn("Reading short interest and options", first_page)
+            self.assertIn(ctx["stocks"][-1]["symbol"], reader.pages[-2].extract_text())
+            self.assertIn("Reading short interest and options", reader.pages[-1].extract_text())
+
+    def test_preview_stacks_every_page(self):
+        from PIL import Image
+        from src.pdf_report import NewsletterPDF
+        from src.preview import render_preview
+        formatter, ctx, pipeline = build_report()
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = NewsletterPDF(formatter).build(ctx, pipeline, os.path.join(tmp, "report.pdf"))
+            png = render_preview(pdf, os.path.join(tmp, "preview.png"))
+            with Image.open(png) as im:
+                # Letter pages are 11" tall by 8.5" wide, so N stacked pages are > N * 1.29x as tall as wide
+                self.assertGreater(im.height, (2 + len(ctx["stocks"])) * 1.29 * im.width)
 
 
 class DispatcherTests(unittest.TestCase):

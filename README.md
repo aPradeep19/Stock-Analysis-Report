@@ -2,6 +2,14 @@
 
 A pre-market brief for the stocks I follow, emailed every weekday at 7 AM Central.
 
+## Today's report
+
+Updated every weekday morning. Click it to open the PDF.
+
+[![Today's pre-market brief](https://raw.githubusercontent.com/aPradeep19/Stock-Analysis-Report/reports/latest.png)](https://github.com/aPradeep19/Stock-Analysis-Report/blob/reports/latest.pdf)
+
+## How it works
+
 It pulls quotes, news and earnings dates from Finnhub, price history from Yahoo Finance, flags anything worth looking at (big gaps, volume spikes, RSI extremes, moving average crosses, 52-week highs/lows, upcoming earnings) and sends it out with a PDF attached. Runs for free on GitHub Actions.
 
 The watchlist and alert thresholds live in `config.yaml`.
@@ -37,7 +45,7 @@ GitHub pauses scheduled workflows after 60 days with no commits, so if the email
 ## Tests
 
 ```bash
-pip install pytest
+pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 

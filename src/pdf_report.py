@@ -3,7 +3,8 @@ PDF Newsletter
 
 Page 1 is the header page: market backdrop, the big & concerning moves, and the whole
 watchlist at a glance. After that, every stock gets its own page with a chart, its key
-metrics, its alerts and signals, and the latest headlines.
+metrics, its alerts and signals, and the latest headlines. The last page explains what the
+short interest and options levels mean.
 
 Design decisions:
 1. Built from the same `context` as the email (src/formatter.py), so the two always agree.
@@ -86,6 +87,8 @@ class NewsletterPDF:
         for stock in ctx["stocks"]:
             story.append(PageBreak())
             story += self._stock_page(stock, ctx, pipeline_data.get(stock["symbol"], {}))
+        story.append(PageBreak())
+        story += self._positioning_page()
 
         def footer(canvas, _doc):
             canvas.saveState()
@@ -209,18 +212,6 @@ class NewsletterPDF:
                                        ("TOPPADDING", (0, 0), (-1, -1), 6)]))
             story.append(table)
 
-        # What each short-interest / options level means (same table as the email)
-        story.append(Paragraph("Reading short interest and options", s["h2"]))
-        story.append(Paragraph(escape(self.formatter.positioning_note()), s["small"]))
-        for title, rows in self.formatter.positioning_guide():
-            table = Table([[Paragraph(escape(r), s["small"]), Paragraph(f"<b>{escape(name)}</b>", s["small"]),
-                            Paragraph(escape(meaning), s["small"])] for r, name, meaning in rows],
-                          colWidths=[CONTENT_W * 0.13, CONTENT_W * 0.13, CONTENT_W * 0.74])
-            table.setStyle(TableStyle([("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor(HAIRLINE)),
-                                       ("LEFTPADDING", (0, 0), (-1, -1), 0), ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                                       ("TOPPADDING", (0, 0), (-1, -1), 1.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5)]))
-            story.append(KeepTogether([Paragraph(f"<b>{escape(title)}</b>", s["cell"]), table]))
-
         t = ctx["thresholds"]
         story += [Spacer(1, 14), Paragraph(
             f"How alerts work: a pre-market gap of ±{t.get('premarket_gap_pct', 3.0):g}% or a last-session move of "
@@ -298,4 +289,21 @@ class NewsletterPDF:
                 source = escape(article.get("source") or "")
                 story.append(Paragraph(f"{link} <font size='7.5' color='{MUTED}'>{('— ' + source) if source else ''}</font>",
                                        ParagraphStyle("news", parent=s["bullet"], fontSize=9), bulletText="•"))
+        return story
+
+    # ------------------------------------------------------------------ #
+    # Last page: what each short-interest / options level means
+    # ------------------------------------------------------------------ #
+    def _positioning_page(self):
+        s = self.s
+        story = [Paragraph("Reading short interest and options", s["h2"]),
+                 Paragraph(escape(self.formatter.positioning_note()), s["body"])]
+        for title, rows in self.formatter.positioning_guide():
+            table = Table([[Paragraph(escape(r), s["cell"]), Paragraph(f"<b>{escape(name)}</b>", s["cell"]),
+                            Paragraph(escape(meaning), s["cell"])] for r, name, meaning in rows],
+                          colWidths=[CONTENT_W * 0.14, CONTENT_W * 0.14, CONTENT_W * 0.72])
+            table.setStyle(TableStyle([("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor(HAIRLINE)),
+                                       ("LEFTPADDING", (0, 0), (-1, -1), 0), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                       ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3)]))
+            story.append(KeepTogether([Paragraph(escape(title), s["h3"]), table]))
         return story
