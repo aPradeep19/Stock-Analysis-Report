@@ -99,7 +99,7 @@ class PdfTests(unittest.TestCase):
             self.assertIn(ctx["stocks"][-1]["symbol"], reader.pages[-2].extract_text())
             self.assertIn("Reading short interest and options", reader.pages[-1].extract_text())
 
-    def test_preview_stacks_every_page(self):
+    def test_preview_shows_first_two_pages(self):
         from PIL import Image
         from src.pdf_report import NewsletterPDF
         from src.preview import render_preview
@@ -108,8 +108,8 @@ class PdfTests(unittest.TestCase):
             pdf = NewsletterPDF(formatter).build(ctx, pipeline, os.path.join(tmp, "report.pdf"))
             png = render_preview(pdf, os.path.join(tmp, "preview.png"))
             with Image.open(png) as im:
-                # Letter pages are 11" tall by 8.5" wide, so N stacked pages are > N * 1.29x as tall as wide
-                self.assertGreater(im.height, (2 + len(ctx["stocks"])) * 1.29 * im.width)
+                # A letter page is 11/8.5 = 1.29x as tall as wide; two pages plus the gap is just over 2.59x
+                self.assertAlmostEqual(im.height / im.width, 2 * 11 / 8.5, delta=0.05)
 
 
 class DispatcherTests(unittest.TestCase):

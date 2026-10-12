@@ -1,9 +1,9 @@
 """
 PDF Preview Image
 
-Turns the newsletter PDF into one tall PNG with every page stacked top to bottom. GitHub can't
-embed a PDF in a README, but it can show an image, so the workflow publishes this next to the
-PDF and the README links one to the other.
+Turns the first couple of pages of the newsletter PDF into one PNG, stacked top to bottom.
+GitHub can't embed a PDF in a README, but it can show an image, so the workflow publishes this
+next to the PDF and the README links one to the other.
 
 Usage: python -m src.preview output/premarket_<date>.pdf latest.png
 """
@@ -15,20 +15,21 @@ from PIL import Image
 
 GAP = 16             # px of grey between pages so they read as separate sheets
 GAP_COLOR = "#d0d0d0"
+PAGES = 2            # cover page + the first stock page; the full report is one click away
 
 
-def render_preview(pdf_path: str, png_path: str, dpi: int = 110) -> str:
+def render_preview(pdf_path: str, png_path: str, pages: int = PAGES, dpi: int = 110) -> str:
     pdf = pdfium.PdfDocument(pdf_path)
     try:
-        pages = [pdf[i].render(scale=dpi / 72).to_pil() for i in range(len(pdf))]
+        images = [pdf[i].render(scale=dpi / 72).to_pil() for i in range(min(pages, len(pdf)))]
     finally:
         pdf.close()
 
-    width = max(p.width for p in pages)
-    height = sum(p.height for p in pages) + GAP * (len(pages) - 1)
+    width = max(p.width for p in images)
+    height = sum(p.height for p in images) + GAP * (len(images) - 1)
     sheet = Image.new("RGB", (width, height), GAP_COLOR)
     y = 0
-    for page in pages:
+    for page in images:
         sheet.paste(page, (0, y))
         y += page.height + GAP
     sheet.save(png_path, optimize=True)
