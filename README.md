@@ -38,9 +38,19 @@ It skips weekends and holidays on its own. Use `--force` to send anyway.
 
 ## Scheduling
 
-The workflow in `.github/workflows/premarket_report.yml` sends the email at 7 AM Central, Monday to Friday. Add the four variables above as repo secrets and it takes care of itself. You can also start it by hand from the Actions tab.
+The workflow in `.github/workflows/premarket_report.yml` sends the email at 7 AM Central, Monday to Friday. Add the four variables above as repo secrets. You can also start it by hand from the Actions tab.
 
-GitHub pauses scheduled workflows after 60 days with no commits, so if the emails stop, re-enable it there.
+GitHub's own cron is often hours late, so the workflow is meant to be started by an outside scheduler at 7:00 AM:
+
+1. Create a fine-grained personal access token for this repo with **Actions: Read and write**.
+2. On a free scheduler such as [cron-job.org](https://cron-job.org), add a job for 7:00 AM `America/Chicago`, Monday to Friday:
+   - `POST https://api.github.com/repos/<owner>/<repo>/actions/workflows/premarket_report.yml/dispatches`
+   - Headers: `Authorization: Bearer <token>`, `Accept: application/vnd.github+json`
+   - Body: `{"ref":"main","inputs":{"automated":"true"}}`
+
+GitHub's cron stays on as a backup. Automated runs skip themselves if today's report already went out or it's past 8:30 AM Central (the market is open, so the report would be stale). Runs started by hand always go through.
+
+GitHub pauses scheduled workflows after 60 days with no commits, so if the backup stops, re-enable it there.
 
 ## Tests
 
