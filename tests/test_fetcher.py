@@ -63,6 +63,19 @@ class OptionsInterestTests(unittest.TestCase):
         self.assertEqual(data["put_oi"], 110)
         self.assertAlmostEqual(data["put_call_oi_ratio"], 110 / 350)
 
+    def test_counts_calls_expiring_by_friday(self):
+        today = datetime.now(MARKET_TZ).date()
+        friday = today + timedelta(days=(4 - today.weekday()) % 7)
+        chains = {str(friday): chain([300], [10]), str(friday + timedelta(days=7)): chain([100], [10])}
+        ticker = mock.Mock(options=tuple(chains))
+        ticker.option_chain.side_effect = chains.get
+        with mock.patch("src.fetcher.yf.Ticker", return_value=ticker):
+            data = FinnhubFetcher("key").get_options_interest("X", days_ahead=30)
+        self.assertEqual(friday.weekday(), 4)
+        self.assertEqual(data["week_end"], friday.isoformat())
+        self.assertEqual(data["call_oi_week"], 300)
+        self.assertAlmostEqual(data["call_oi_week_pct"], 75.0)
+
     def test_no_listed_options(self):
         with mock.patch("src.fetcher.yf.Ticker", return_value=mock.Mock(options=())):
             self.assertEqual(FinnhubFetcher("key").get_options_interest("X"), {})

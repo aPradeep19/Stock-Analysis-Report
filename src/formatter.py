@@ -366,6 +366,8 @@ class ReportFormatter:
             ("Short interest", with_level(short_interest, "short_level")),
             ("Days to cover", with_level(fmt_num(m.get("short_ratio")), "days_to_cover_level")),
             ("Call open interest", fmt_volume(m.get("call_oi"))),
+            ("Calls expiring this week", "—" if m.get("call_oi_week") is None else
+             f"{fmt_volume(m['call_oi_week'])}  ({fmt_pct(m.get('call_oi_week_pct'), signed=False)})"),
             ("Put/call ratio", with_level(fmt_num(m.get("put_call_oi_ratio"), 2), "put_call_level")),
             ("Next earnings", earnings),
         ]
@@ -453,7 +455,8 @@ class ReportFormatter:
     # ------------------------------------------------------------------ #
     POSITIONING_NOTE = ("These show how traders are betting, not how fast the business is growing: they hint at "
                         "near-term volatility and sentiment. Short interest is reported twice a month; open "
-                        "interest counts option contracts expiring in the next {window} days. Forward P/E uses "
+                        "interest counts option contracts expiring in the next {window} days, and calls "
+                        "expiring this week are flagged when they're {expiring}% or more of those. Forward P/E uses "
                         "analysts' earnings estimates for the next 12 months.")
 
     def positioning_guide(self):
@@ -483,7 +486,8 @@ class ReportFormatter:
         return guide
 
     def positioning_note(self):
-        return self.POSITIONING_NOTE.format(window=self.thresholds.get("options_window_days", 30))
+        return self.POSITIONING_NOTE.format(window=self.thresholds.get("options_window_days", 30),
+                                            expiring=f"{self.thresholds.get('calls_expiring_week_pct', 50):g}")
 
     def _html_positioning_guide(self):
         cell = f"font-size:12px;color:{INK_2};padding:3px 8px 3px 0;vertical-align:top;border-bottom:1px solid {HAIRLINE};"

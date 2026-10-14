@@ -288,23 +288,35 @@ class FinnhubFetcher:
         are where traders position for short-term moves, and longer-dated ones would mostly add
         noise from big hedges, so only the next month is counted. Yahoo updates open interest
         once a day, after the previous session settles.
+
+        Calls expiring by this Friday are also counted on their own ('call_oi_week'), so the report
+        can say how much of the call positioning runs out this week. "By Friday" also catches a
+        Thursday expiration in a holiday week and any Monday-Thursday dailies.
         """
         ticker = yf.Ticker(symbol)
-        cutoff = datetime.now(MARKET_TZ).date() + timedelta(days=days_ahead)
+        today = datetime.now(MARKET_TZ).date()
+        cutoff = today + timedelta(days=days_ahead)
+        week_end = today + timedelta(days=(4 - today.weekday()) % 7)  # this Friday (next Friday on a weekend)
         expirations = [d for d in ticker.options if datetime.strptime(d, "%Y-%m-%d").date() <= cutoff]
         if not expirations:
             return {}
 
-        call_oi = put_oi = 0
+        call_oi = put_oi = call_oi_week = 0
         for expiry in expirations:
             chain = ticker.option_chain(expiry)
-            call_oi += int(chain.calls["openInterest"].fillna(0).sum())
+            calls = int(chain.calls["openInterest"].fillna(0).sum())
+            call_oi += calls
             put_oi += int(chain.puts["openInterest"].fillna(0).sum())
+            if datetime.strptime(expiry, "%Y-%m-%d").date() <= week_end:
+                call_oi_week += calls
         return {
             "call_oi": call_oi,
             "put_oi": put_oi,
             "put_call_oi_ratio": put_oi / call_oi if call_oi else None,
             "options_window_days": days_ahead,
+            "call_oi_week": call_oi_week,
+            "call_oi_week_pct": call_oi_week / call_oi * 100 if call_oi else None,
+            "week_end": week_end.isoformat(),
         }
 
     def get_company_profile(self, symbol: str) -> dict:

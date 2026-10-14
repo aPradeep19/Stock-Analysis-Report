@@ -1,5 +1,6 @@
 import bisect
 import re
+from datetime import date
 import pandas as pd
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
@@ -84,6 +85,7 @@ class QuantitativeAnalyzer:
         self.days_to_cover_levels = self._levels("days_to_cover_levels", [2, 5, 10], DAYS_TO_COVER_LEVELS)
         self.put_call_levels = self._levels("put_call_levels", [0.5, 0.8, 1.2, 1.5], PUT_CALL_LEVELS)
         self.options_min_oi = self.thresholds.get("options_min_open_interest", 1000)
+        self.calls_expiring_pct = self.thresholds.get("calls_expiring_week_pct", 50)
 
     def _levels(self, key, default, levels):
         """Reads a list of level boundaries from config; it needs one fewer number than there are levels."""
@@ -501,6 +503,20 @@ class QuantitativeAnalyzer:
                 elif ratio is not None:
                     text += f" (put/call {ratio:.2f}; too few contracts to read much into)"
                 triggers.append(text)
+
+            # ---- Calls expiring this week ---------------------------------------
+            # When most near-dated calls run out at once, traders close or roll them and dealers
+            # unwind their hedges, which can pin the price near big strikes or loosen it after.
+            week_calls, week_pct = metrics.get("call_oi_week"), metrics.get("call_oi_week_pct")
+            if week_calls is not None and week_pct is not None and metrics.get("week_end"):
+                friday = date.fromisoformat(metrics["week_end"])
+                when = f"{friday:%a %b} {friday.day}" + (" (monthly expiration)" if 15 <= friday.day <= 21 else "")
+                text = f"{_count(week_calls)} calls ({week_pct:.0f}% of near-term calls) expire by {when}"
+                triggers.append(text)
+                if week_pct >= self.calls_expiring_pct and week_calls >= self.options_min_oi:
+                    alerts.append({"text": f"{text}: expect hedging flows and possible pinning near big strikes, "
+                                           f"then a freer move once they roll off",
+                                   "direction": CAUTION, "kind": "positioning", "severity": 0.6})
 
             # ---- Upcoming earnings (event risk) ---------------------------------
             event = earnings.get(symbol)

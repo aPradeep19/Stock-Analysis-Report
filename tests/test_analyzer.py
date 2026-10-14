@@ -169,6 +169,24 @@ class PositioningTests(unittest.TestCase):
         self.assertEqual(self.positioning(result), [])
         self.assertNotIn("put_call_level", result["metrics"])
 
+    def test_most_calls_expiring_this_week_alerts(self):
+        result = self.analyze(call_oi_week=133_410, call_oi_week_pct=64.3, week_end="2026-10-16")
+        self.assertIn("133K calls (64% of near-term calls) expire by Fri Oct 16 (monthly expiration)",
+                      result["triggers"])
+        alerts = self.positioning(result)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["direction"], "caution")
+        self.assertLess(alerts[0]["severity"], 1.0)
+
+    def test_few_calls_expiring_is_a_signal_only(self):
+        result = self.analyze(call_oi_week=20_000, call_oi_week_pct=25.0, week_end="2026-10-23")
+        self.assertIn("20K calls (25% of near-term calls) expire by Fri Oct 23", result["triggers"])
+        self.assertEqual(self.positioning(result), [])
+
+    def test_thin_weekly_calls_are_not_flagged(self):
+        result = self.analyze(call_oi_week=400, call_oi_week_pct=90.0, week_end="2026-10-23")
+        self.assertEqual(self.positioning(result), [])
+
     def test_forward_pe_uses_last_close_and_12_month_eps(self):
         result = self.analyze(forward_eps=2.0, forward_pe=99.0)  # 99.0 = Yahoo's fallback, ignored
         self.assertAlmostEqual(result["metrics"]["forward_pe"], result["metrics"]["last_close"] / 2.0)

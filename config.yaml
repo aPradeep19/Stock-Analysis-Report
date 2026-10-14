@@ -36,6 +36,8 @@ analysis_thresholds:
                                            #   neutral / cautious / bearish (alert)
   options_window_days: 30          # count open interest for expirations this many days out
   options_min_open_interest: 1000  # ignore the ratio on thinly traded option chains
+  calls_expiring_week_pct: 50      # alert when this % of those calls expire by Friday. Monthly
+                                   #   expiration weeks (3rd Friday) usually trip it for most stocks
 
 report:
   title: "Pre-Market Brief"

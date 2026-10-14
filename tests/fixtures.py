@@ -75,7 +75,9 @@ def sample_pipeline():
                              "dividend_yield": None, "short_pct_float": 4.0 + i * 6, "short_ratio": 1.5 + i,
                              "short_change_pct": 8.0, "call_oi": 120_000 - i * 15_000, "put_oi": 60_000 + i * 10_000,
                              "put_call_oi_ratio": (60_000 + i * 10_000) / (120_000 - i * 15_000),
-                             "options_window_days": 30},
+                             "options_window_days": 30, "call_oi_week": 70_000 - i * 12_000,
+                             "call_oi_week_pct": (70_000 - i * 12_000) / (120_000 - i * 15_000) * 100,
+                             "week_end": "2026-10-16"},
         }
     # One ticker whose price history failed
     pipeline["ZZZ"] = {"quote": {}, "candles": pd.DataFrame(), "news": [], "premarket": {}, "fundamentals": {}}

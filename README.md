@@ -4,7 +4,7 @@ A pre-market brief for the stocks I follow, emailed every weekday at 7 AM Centra
 
 ## Today's report
 
-Updated every weekday morning. These are the first two pages; click them to open the full PDF.
+Updated every weekday morning. This is the first page; click it to read the full report.
 
 [![Today's pre-market brief](https://raw.githubusercontent.com/aPradeep19/Stock-Analysis-Report/reports/latest.png)](https://github.com/aPradeep19/Stock-Analysis-Report/blob/reports/latest.pdf)
 
