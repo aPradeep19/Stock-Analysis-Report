@@ -73,9 +73,10 @@ class FormatterTests(unittest.TestCase):
                                   ("15% and up", "Very high")])
         self.assertEqual(len(guide["Put/call open interest"]), 5)
         text = self.formatter.render_text(self.ctx)
-        self.assertIn("READING SHORT INTEREST AND OPTIONS", text)
+        self.assertIn("READING SHORT INTEREST, OPTIONS AND CASH RUNWAY", text)
+        self.assertEqual([name for _, name, _ in guide["Cash runway (months)"]], ["Short", "Moderate", "Long"])
         self.assertIn("not how fast the business is growing", text)
-        self.assertIn("Reading short interest and options", self.formatter.render_html(self.ctx))
+        self.assertIn("Reading short interest, options and cash runway", self.formatter.render_html(self.ctx))
 
     def test_number_formatting(self):
         self.assertEqual(fmt_pct(4.56), "+4.6%")
@@ -95,9 +96,9 @@ class PdfTests(unittest.TestCase):
             self.assertGreaterEqual(len(reader.pages), 2 + len(ctx["stocks"]))
             first_page = reader.pages[0].extract_text()
             self.assertIn("Big & concerning moves", first_page)
-            self.assertNotIn("Reading short interest and options", first_page)
+            self.assertNotIn("Reading short interest, options and cash runway", first_page)
             self.assertIn(ctx["stocks"][-1]["symbol"], reader.pages[-2].extract_text())
-            self.assertIn("Reading short interest and options", reader.pages[-1].extract_text())
+            self.assertIn("Reading short interest, options and cash runway", reader.pages[-1].extract_text())
 
     def test_preview_shows_first_page_only(self):
         from PIL import Image

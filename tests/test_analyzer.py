@@ -187,6 +187,38 @@ class PositioningTests(unittest.TestCase):
         result = self.analyze(call_oi_week=400, call_oi_week_pct=90.0, week_end="2026-10-23")
         self.assertEqual(self.positioning(result), [])
 
+    def test_institutional_ownership_signal(self):
+        result = self.analyze(institutional_pct=71.4)
+        self.assertIn("Institutions hold 71.4% of shares", result["triggers"])
+        self.assertEqual(self.positioning(result), [])
+
+    def test_net_debt(self):
+        result = self.analyze(total_debt_m=10_200, total_cash_m=8_040, operating_cashflow_m=5_260)
+        self.assertAlmostEqual(result["metrics"]["net_debt_m"], 2_160)
+        self.assertIn("Net debt $2.2B (debt $10.2B, cash $8.0B)", result["triggers"])
+        self.assertNotIn("cash_runway_months", result["metrics"])  # cash-flow positive: no runway
+
+    def test_net_cash(self):
+        result = self.analyze(total_debt_m=38_860, total_cash_m=62_470)
+        self.assertIn("Net cash $23.6B (debt $38.9B, cash $62.5B)", result["triggers"])
+
+    def test_short_cash_runway_alerts(self):
+        result = self.analyze(total_debt_m=170, total_cash_m=30, operating_cashflow_m=-140)
+        self.assertAlmostEqual(result["metrics"]["cash_runway_months"], 30 / 140 * 12)
+        self.assertEqual(result["metrics"]["cash_runway_level"], "Short")
+        self.assertTrue(any(t.startswith("Burning $140M a year from operations: cash lasts ~3 months at that "
+                                         "rate (short)") for t in result["triggers"]))
+        alerts = [a for a in result["alerts"] if a["kind"] == "balance_sheet"]
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("Cash runway ~3 months: $30M of cash, burning $140M a year", alerts[0]["text"])
+        self.assertLess(alerts[0]["severity"], 1.0)  # page only, never the header
+
+    def test_long_cash_runway_is_a_signal_only(self):
+        result = self.analyze(total_debt_m=1, total_cash_m=140, operating_cashflow_m=-30)
+        self.assertEqual(result["metrics"]["cash_runway_level"], "Long")
+        self.assertTrue(any("cash lasts ~4.7 years" in t for t in result["triggers"]))
+        self.assertEqual([a for a in result["alerts"] if a["kind"] == "balance_sheet"], [])
+
     def test_forward_pe_uses_last_close_and_12_month_eps(self):
         result = self.analyze(forward_eps=2.0, forward_pe=99.0)  # 99.0 = Yahoo's fallback, ignored
         self.assertAlmostEqual(result["metrics"]["forward_pe"], result["metrics"]["last_close"] / 2.0)

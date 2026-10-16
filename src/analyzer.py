@@ -52,6 +52,13 @@ PUT_CALL_LEVELS = (
                 "pessimism as a sign of a bottom."),
 )
 
+RUNWAY_LEVELS = (
+    ("Short", "under a year of cash at the current burn. Expect a share sale or new debt soon, which can "
+              "dilute holders or add interest costs."),
+    ("Moderate", "a year or two of cash. A raise is likely before the business pays for itself."),
+    ("Long", "two years or more of cash, so no near-term pressure to raise money."),
+)
+
 
 def level_of(value, bounds, levels):
     """The (name, meaning) a value falls in. Bounds [5, 10, 20] split values into <5, 5-10, 10-20, 20+."""
@@ -64,6 +71,22 @@ def _count(value):
         if value >= size:
             return f"{value / size:.{0 if value >= size * 10 else 1}f}{suffix}"
     return f"{value:,.0f}"
+
+
+def _dollars(millions):
+    """Short form for dollar amounts given in millions: 2160 -> '$2.2B', 140 -> '$140M'."""
+    millions = abs(millions)
+    for size, suffix in ((1e6, "T"), (1e3, "B")):
+        if millions >= size:
+            return f"${millions / size:.1f}{suffix}"
+    return f"${millions:.0f}M" if millions >= 1 else f"${millions * 1000:.0f}K"
+
+
+def runway_text(months):
+    """'~3 months', '~4.7 years': shared with the formatter so the signal and the metric row agree."""
+    if months < 1:
+        return "under a month"
+    return f"~{months:.0f} months" if months < 24 else f"~{months / 12:.1f} years"
 
 
 class QuantitativeAnalyzer:
@@ -86,6 +109,7 @@ class QuantitativeAnalyzer:
         self.put_call_levels = self._levels("put_call_levels", [0.5, 0.8, 1.2, 1.5], PUT_CALL_LEVELS)
         self.options_min_oi = self.thresholds.get("options_min_open_interest", 1000)
         self.calls_expiring_pct = self.thresholds.get("calls_expiring_week_pct", 50)
+        self.runway_levels = self._levels("cash_runway_levels_months", [12, 24], RUNWAY_LEVELS)
 
     def _levels(self, key, default, levels):
         """Reads a list of level boundaries from config; it needs one fewer number than there are levels."""
@@ -517,6 +541,33 @@ class QuantitativeAnalyzer:
                     alerts.append({"text": f"{text}: expect hedging flows and possible pinning near big strikes, "
                                            f"then a freer move once they roll off",
                                    "direction": CAUTION, "kind": "positioning", "severity": 0.6})
+
+            # ---- Institutional ownership (quarterly 13F filings) ----------------
+            inst_pct = metrics.get("institutional_pct")
+            if inst_pct is not None:
+                triggers.append(f"Institutions hold {inst_pct:.1f}% of shares")
+
+            # ---- Debt: net debt and, for cash-burning companies, runway ---------
+            # Gross debt alone says little: what matters is the cash held against it and whether
+            # the business generates cash or burns it.
+            debt, cash = metrics.get("total_debt_m"), metrics.get("total_cash_m")
+            op_cash = metrics.get("operating_cashflow_m")
+            if debt is not None and cash is not None:
+                net_debt = debt - cash
+                metrics["net_debt_m"] = net_debt
+                label = "Net debt" if net_debt > 0 else "Net cash"
+                triggers.append(f"{label} {_dollars(net_debt)} (debt {_dollars(debt)}, cash {_dollars(cash)})")
+            if op_cash is not None and op_cash < 0 and cash is not None:
+                months = cash / -op_cash * 12
+                runway_level, runway_meaning = level_of(months, self.runway_levels, RUNWAY_LEVELS)
+                metrics["cash_runway_months"] = months
+                metrics["cash_runway_level"] = runway_level
+                triggers.append(f"Burning {_dollars(op_cash)} a year from operations: cash lasts {runway_text(months)} "
+                                f"at that rate ({runway_level.lower()}), {runway_meaning}")
+                if runway_level == "Short":
+                    alerts.append({"text": f"Cash runway {runway_text(months)}: {_dollars(cash)} of cash, burning "
+                                           f"{_dollars(op_cash)} a year. A share sale or new debt is likely soon",
+                                   "direction": CAUTION, "kind": "balance_sheet", "severity": 0.8})
 
             # ---- Upcoming earnings (event risk) ---------------------------------
             event = earnings.get(symbol)

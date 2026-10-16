@@ -19,6 +19,8 @@ class YahooFundamentalsTests(unittest.TestCase):
         fiscal_year_end = datetime.now(MARKET_TZ) + timedelta(days=73)  # 20% of this fiscal year left
         info = {"forwardPE": 15.1, "sharesShort": 120, "sharesShortPriorMonth": 100,
                 "shortPercentOfFloat": 0.1504, "shortRatio": 1.94, "marketCap": 2_000_000_000,
+                "heldPercentInstitutions": 0.71398, "totalDebt": 10_200_000_000, "totalCash": 8_040_000_000,
+                "operatingCashflow": -140_000_000,
                 "nextFiscalYearEnd": int(fiscal_year_end.timestamp())}
         estimates = pd.DataFrame({"avg": [2.5, 2.7, 10.0, 15.0]}, index=["0q", "+1q", "0y", "+1y"])
         with mock.patch("src.fetcher.yf.Ticker", return_value=SimpleNamespace(info=info, earnings_estimate=estimates)):
@@ -27,6 +29,9 @@ class YahooFundamentalsTests(unittest.TestCase):
         self.assertIsNone(data["forward_pe"])  # Yahoo's figure only used without estimates
         self.assertAlmostEqual(data["short_pct_float"], 15.04)
         self.assertAlmostEqual(data["short_change_pct"], 20.0)
+        self.assertAlmostEqual(data["institutional_pct"], 71.398)
+        self.assertEqual((data["total_debt_m"], data["total_cash_m"], data["operating_cashflow_m"]),
+                         (10_200, 8_040, -140))
         self.assertEqual(data["market_cap_m"], 2000)
         self.assertIsNone(data["beta"])  # missing fields stay None so Finnhub's values win
 
@@ -36,6 +41,7 @@ class YahooFundamentalsTests(unittest.TestCase):
             data = FinnhubFetcher("key").get_yahoo_fundamentals("X")
         self.assertIsNone(data["forward_eps"])
         self.assertEqual(data["forward_pe"], 15.1)
+        self.assertIsNone(data["institutional_pct"])
 
     def test_ntm_eps_blend(self):
         today = datetime(2026, 10, 6).date()

@@ -38,6 +38,8 @@ analysis_thresholds:
   options_min_open_interest: 1000  # ignore the ratio on thinly traded option chains
   calls_expiring_week_pct: 50      # alert when this % of those calls expire by Friday. Monthly
                                    #   expiration weeks (3rd Friday) usually trip it for most stocks
+  cash_runway_levels_months: [12, 24]  # cash-burning companies: months of cash left at the current burn.
+                                       #   short (alert) / moderate / long
 
 report:
   title: "Pre-Market Brief"

@@ -39,6 +39,10 @@ TONE_PDF = {
 PAGE_W, PAGE_H = letter
 MARGIN = 0.6 * inch
 CONTENT_W = PAGE_W - 2 * MARGIN
+# Usable height inside a page: the margins set in build(), less the frame's 6pt padding top and
+# bottom, less 2pt so rounding never tips a block that exactly fits onto the next page
+FRAME_H = PAGE_H - MARGIN - (MARGIN + 10) - 12 - 2
+CHART_MIN_SCALE = 0.6
 
 
 def _styles():
@@ -242,11 +246,6 @@ class NewsletterPDF:
                                  ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
         story = [top, Spacer(1, 8)]
 
-        candles = raw.get("candles")
-        if candles is not None and not candles.empty:
-            png = price_volume_chart(candles, m)
-            story.append(Image(png, width=CONTENT_W, height=CONTENT_W * 3.3 / 7.3, kind="proportional"))
-
         # Left column: every key metric. Right column: alerts + signals.
         metric_rows = [[Paragraph(escape(k), s["small"]), Paragraph(escape(v), s["cell_r"])]
                        for k, v in self.formatter._metric_rows(stock)]
@@ -273,6 +272,17 @@ class NewsletterPDF:
         columns = Table([[left, right]], colWidths=[CONTENT_W * 0.48, CONTENT_W * 0.52])
         columns.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0),
                                      ("RIGHTPADDING", (0, 0), (0, -1), 14), ("RIGHTPADDING", (1, 0), (1, -1), 0)]))
+
+        # The metrics/signals block is one table row, so it can't split across pages: if it doesn't
+        # fit under the chart, it jumps to the next page and leaves the chart stranded. A stock with
+        # a long list of signals gets a shorter chart instead (down to CHART_MIN_SCALE of full size).
+        candles = raw.get("candles")
+        if candles is not None and not candles.empty:
+            full = CONTENT_W * 3.3 / 7.3
+            spare = FRAME_H - top.wrap(CONTENT_W, FRAME_H)[1] - 12 - columns.wrap(CONTENT_W, FRAME_H)[1]
+            height = max(min(full, spare), full * CHART_MIN_SCALE)
+            png = price_volume_chart(candles, m)
+            story.append(Image(png, width=CONTENT_W, height=height, kind="proportional"))
         story += [Spacer(1, 4), columns]
 
         news = stock.get("top_news", [])[:ctx["news_per_stock"]]
@@ -296,7 +306,7 @@ class NewsletterPDF:
     # ------------------------------------------------------------------ #
     def _positioning_page(self):
         s = self.s
-        story = [Paragraph("Reading short interest and options", s["h2"]),
+        story = [Paragraph("Reading short interest, options and cash runway", s["h2"]),
                  Paragraph(escape(self.formatter.positioning_note()), s["body"])]
         for title, rows in self.formatter.positioning_guide():
             table = Table([[Paragraph(escape(r), s["cell"]), Paragraph(f"<b>{escape(name)}</b>", s["cell"]),

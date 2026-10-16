@@ -20,7 +20,7 @@ Design decisions:
 import html
 from datetime import datetime
 
-from src.analyzer import DAYS_TO_COVER_LEVELS, PUT_CALL_LEVELS, SHORT_INTEREST_LEVELS
+from src.analyzer import DAYS_TO_COVER_LEVELS, PUT_CALL_LEVELS, RUNWAY_LEVELS, SHORT_INTEREST_LEVELS, runway_text
 
 # Palette (shared with the PDF). Status colors are reserved for good/bad meaning.
 INK = "#0b0b0b"
@@ -349,6 +349,21 @@ class ReportFormatter:
 
         short_pct = m.get("short_pct_float")
         short_interest = "—" if short_pct is None else f"{fmt_pct(short_pct, signed=False)} of float"
+        inst_pct = m.get("institutional_pct")
+        net_debt = m.get("net_debt_m")
+        if net_debt is None:
+            net_debt_text = "—"
+        elif net_debt > 0:
+            net_debt_text = fmt_market_cap(net_debt)
+        else:
+            net_debt_text = f"−{fmt_market_cap(-net_debt)} (net cash)" if net_debt < 0 else "$0"
+        months = m.get("cash_runway_months")
+        if months is not None:
+            runway = with_level(runway_text(months), "cash_runway_level")
+        elif (m.get("operating_cashflow_m") or 0) > 0:
+            runway = "Cash-flow positive"
+        else:
+            runway = "—"
         return [
             (session_labels(m.get("premarket_session"))["metric"],
              f"{fmt_money(m.get('premarket_price'))}  ({fmt_pct(m.get('gap_pct'))})"),
@@ -363,12 +378,15 @@ class ReportFormatter:
             ("Market cap", fmt_market_cap(m.get("market_cap_m"))),
             ("Forward P/E (12 mo)", fmt_num(m.get("forward_pe"))),
             ("Beta", fmt_num(m.get("beta"), 2)),
+            ("Net debt", net_debt_text),
+            ("Cash runway", runway),
             ("Short interest", with_level(short_interest, "short_level")),
             ("Days to cover", with_level(fmt_num(m.get("short_ratio")), "days_to_cover_level")),
             ("Call open interest", fmt_volume(m.get("call_oi"))),
             ("Calls expiring this week", "—" if m.get("call_oi_week") is None else
              f"{fmt_volume(m['call_oi_week'])}  ({fmt_pct(m.get('call_oi_week_pct'), signed=False)})"),
             ("Put/call ratio", with_level(fmt_num(m.get("put_call_oi_ratio"), 2), "put_call_level")),
+            ("Institutional ownership", "—" if inst_pct is None else f"{fmt_pct(inst_pct, signed=False)} of shares"),
             ("Next earnings", earnings),
         ]
 
@@ -387,7 +405,8 @@ class ReportFormatter:
         # The PDF page shows the full set from _metric_rows().
         email_keys = (label["metric"], "Last close", "Typical daily move", "Volume vs 20-day avg",
                       "RSI (14-day)", "52-week range", "1-month return", "Forward P/E (12 mo)",
-                      "Short interest", "Put/call ratio", "Next earnings")
+                      "Short interest", "Put/call ratio", "Institutional ownership",
+                      "Net debt", "Cash runway", "Next earnings")
         pairs = [(k, v) for k, v in self._metric_rows(stock) if k in email_keys and v != "—"]
         metric_rows = "".join(
             f"<tr><td style='font-size:13px;color:{INK_2};padding:5px 8px 5px 0;border-bottom:1px solid {HAIRLINE};'>{e(k)}</td>"
@@ -456,8 +475,12 @@ class ReportFormatter:
     POSITIONING_NOTE = ("These show how traders are betting, not how fast the business is growing: they hint at "
                         "near-term volatility and sentiment. Short interest is reported twice a month; open "
                         "interest counts option contracts expiring in the next {window} days, and calls "
-                        "expiring this week are flagged when they're {expiring}% or more of those. Forward P/E uses "
-                        "analysts' earnings estimates for the next 12 months.")
+                        "expiring this week are flagged when they're {expiring}% or more of those. Institutional "
+                        "ownership comes from funds' quarterly 13F filings, so it moves in steps as filings arrive "
+                        "(mostly mid-Feb, May, Aug and Nov). It can top 100% because lent-out shares get counted "
+                        "twice. Forward P/E uses analysts' earnings estimates for the next 12 months. Net debt is debt "
+                        "minus cash (negative means more cash than debt). Cash runway is cash divided by the cash "
+                        "the business burned over the last 12 months, shown only for companies losing cash.")
 
     def positioning_guide(self):
         """
@@ -477,6 +500,8 @@ class ReportFormatter:
             ("Days to cover", t.get("days_to_cover_levels", [2, 5, 10]), lambda v: f"{v:g}", DAYS_TO_COVER_LEVELS),
             ("Put/call open interest", t.get("put_call_levels", [0.5, 0.8, 1.2, 1.5]), lambda v: f"{v:g}",
              PUT_CALL_LEVELS),
+            ("Cash runway (months)", t.get("cash_runway_levels_months", [12, 24]), lambda v: f"{v:g}",
+             RUNWAY_LEVELS),
         )
         guide = []
         for title, bounds, fmt, levels in sections:
@@ -499,7 +524,7 @@ class ReportFormatter:
             tables.append(f"<div style='font-size:13px;font-weight:600;margin:10px 0 2px;'>{e(title)}</div>"
                           f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0' "
                           f"style='border-collapse:collapse;'>{body}</table>")
-        inner = (self._h2("Reading short interest and options", self.positioning_note()) + "".join(tables))
+        inner = (self._h2("Reading short interest, options and cash runway", self.positioning_note()) + "".join(tables))
         return self._card(inner)
 
     def _html_footer(self, ctx, pdf_attached):
@@ -512,7 +537,7 @@ class ReportFormatter:
         pdf_note = "The full newsletter is attached as a PDF. " if pdf_attached else ""
         return (f"<tr><td style='padding:4px 8px 24px;font-size:12px;line-height:1.5;color:{INK_2};'>"
                 f"{pdf_note}{e(rules)}<br><br>Data: Finnhub (quotes, news, fundamentals, earnings) and Yahoo Finance "
-                f"(price history, pre-market trades, forward P/E, short interest, options). "
+                f"(price history, pre-market trades, forward P/E, short interest, options, institutional ownership, debt and cash). "
                 f"Automated analysis for information only, not investment advice."
                 f"</td></tr>")
 
@@ -560,7 +585,7 @@ class ReportFormatter:
                 lines.append(f"  * {article.get('headline')} {url}".rstrip())
             lines.append("")
 
-        lines.append("READING SHORT INTEREST AND OPTIONS")
+        lines.append("READING SHORT INTEREST, OPTIONS AND CASH RUNWAY")
         lines.append(f"  {self.positioning_note()}")
         for title, rows in self.positioning_guide():
             lines.append(f"  {title}")

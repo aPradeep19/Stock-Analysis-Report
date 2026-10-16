@@ -234,12 +234,25 @@ class FinnhubFetcher:
           'short_pct_float':  shares sold short as a % of the tradable float
           'short_ratio':      "days to cover": shares short / average daily volume
           'short_change_pct': change vs. the prior report, so a growing short position stands out
+
+        'institutional_pct' is the % of shares outstanding held by institutions (funds, banks,
+        pensions), built from their quarterly 13F filings.
+
+        Debt and cash come from the latest quarterly balance sheet; operating cash flow is the last
+        12 months. The analyzer turns them into net debt and, for companies burning cash, a runway.
+        Yahoo's own 'freeCashflow' isn't used: it's computed oddly (GEV's came out above its operating
+        cash flow), so the runway is based on operating cash flow instead.
         Market cap and beta come along too, as fallbacks when Finnhub has none.
         """
         ticker = yf.Ticker(symbol)
         info = ticker.info or {}
         shares_short, prior = info.get("sharesShort"), info.get("sharesShortPriorMonth")
         short_pct = info.get("shortPercentOfFloat")
+        institutional = info.get("heldPercentInstitutions")
+
+        def millions(key):
+            value = info.get(key)
+            return value / 1e6 if value is not None else None
         market_cap = info.get("marketCap")
 
         forward_eps = None
@@ -261,6 +274,10 @@ class FinnhubFetcher:
             "short_pct_float": short_pct * 100 if short_pct is not None else None,
             "short_ratio": info.get("shortRatio"),
             "short_change_pct": (shares_short / prior - 1) * 100 if shares_short and prior else None,
+            "institutional_pct": institutional * 100 if institutional is not None else None,
+            "total_debt_m": millions("totalDebt"),
+            "total_cash_m": millions("totalCash"),
+            "operating_cashflow_m": millions("operatingCashflow"),
             "market_cap_m": market_cap / 1e6 if market_cap else None,
             "beta": info.get("beta"),
         }

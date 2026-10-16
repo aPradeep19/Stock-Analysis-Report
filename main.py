@@ -3,7 +3,8 @@ Pipeline entry point
 --------------------
 Runs the whole morning job in order:
 
-  1. Fetch    (src/fetcher.py)    prices, pre-market trades, news, fundamentals, short interest, options, earnings, market
+  1. Fetch    (src/fetcher.py)    prices, pre-market trades, news, fundamentals, short interest, options,
+                                  institutional ownership, earnings, market
   2. Analyze  (src/analyzer.py)   indicators -> signals -> ranked alerts
   3. Format   (src/formatter.py, src/pdf_report.py)   email HTML + text + PDF newsletter
   4. Dispatch (src/dispatcher.py) Gmail SMTP to the recipient list

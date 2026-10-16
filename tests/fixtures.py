@@ -77,7 +77,9 @@ def sample_pipeline():
                              "put_call_oi_ratio": (60_000 + i * 10_000) / (120_000 - i * 15_000),
                              "options_window_days": 30, "call_oi_week": 70_000 - i * 12_000,
                              "call_oi_week_pct": (70_000 - i * 12_000) / (120_000 - i * 15_000) * 100,
-                             "week_end": "2026-10-16"},
+                             "week_end": "2026-10-16", "institutional_pct": 85.0 - i * 9,
+                             "total_debt_m": 2_000 + i * 1_500, "total_cash_m": 9_000 - i * 1_700,
+                             "operating_cashflow_m": -400.0 if symbol == "DDD" else 5_000 - i * 600},
         }
     # One ticker whose price history failed
     pipeline["ZZZ"] = {"quote": {}, "candles": pd.DataFrame(), "news": [], "premarket": {}, "fundamentals": {}}
