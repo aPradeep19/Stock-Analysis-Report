@@ -1,4 +1,5 @@
 """Tests for the alert rules. Each test builds a tiny synthetic history with one known property."""
+
 import unittest
 
 import numpy as np
@@ -8,17 +9,31 @@ from src.analyzer import PUT_CALL_LEVELS, SHORT_INTEREST_LEVELS, QuantitativeAna
 from tests.fixtures import make_candles
 
 THRESHOLDS = {
-    "price_change_pct": 5.0, "premarket_gap_pct": 3.0, "unusual_move_sigma": 2.0, "min_move_pct": 1.5,
-    "volume_surge_multiplier": 2.0, "rsi_oversold": 30, "rsi_overbought": 70, "rsi_bullish": 50,
-    "near_52w_pct": 3.0, "earnings_lookahead_days": 7,
+    "price_change_pct": 5.0,
+    "premarket_gap_pct": 3.0,
+    "unusual_move_sigma": 2.0,
+    "min_move_pct": 1.5,
+    "volume_surge_multiplier": 2.0,
+    "rsi_oversold": 30,
+    "rsi_overbought": 70,
+    "rsi_bullish": 50,
+    "near_52w_pct": 3.0,
+    "earnings_lookahead_days": 7,
 }
 
 
 def one_stock(candles, gap_pct=None, news=None, fundamentals=None):
     last = float(candles["close"].iloc[-1])
     premarket = {} if gap_pct is None else {"price": last * (1 + gap_pct / 100), "session": "pre-market"}
-    return {"X": {"quote": {}, "candles": candles, "news": news or [], "premarket": premarket,
-                  "fundamentals": fundamentals or {}}}
+    return {
+        "X": {
+            "quote": {},
+            "candles": candles,
+            "news": news or [],
+            "premarket": premarket,
+            "fundamentals": fundamentals or {},
+        }
+    }
 
 
 def move_alerts(result):
@@ -69,10 +84,12 @@ class TrendTests(unittest.TestCase):
     def test_close_below_200_day_average(self):
         index = pd.bdate_range(end="2026-09-30", periods=260)
         close = np.full(260, 100.0)
-        close[:-1] += np.linspace(-1, 1, 259)   # gentle slope so averages are well-defined
+        close[:-1] += np.linspace(-1, 1, 259)  # gentle slope so averages are well-defined
         close[-1] = 90.0
-        candles = pd.DataFrame({"open": close, "high": close + 0.5, "low": close - 0.5,
-                                "close": close, "volume": 1_000_000.0}, index=index)
+        candles = pd.DataFrame(
+            {"open": close, "high": close + 0.5, "low": close - 0.5, "close": close, "volume": 1_000_000.0},
+            index=index,
+        )
         alerts = QuantitativeAnalyzer(THRESHOLDS).analyze(one_stock(candles))["X"]["alerts"]
         texts = [a["text"] for a in alerts]
         self.assertTrue(any("below its 200-day average" in t for t in texts), texts)
@@ -82,9 +99,11 @@ class TrendTests(unittest.TestCase):
 class SentimentTests(unittest.TestCase):
     def test_whole_word_matching(self):
         analyzer = QuantitativeAnalyzer(THRESHOLDS)
-        news = [{"headline": "Company mission statement updated"},        # "miss" inside a word: neutral
-                {"headline": "Shares plunge after downgrade"},             # bearish
-                {"headline": "Stock falls as guidance misses estimates"}]  # bearish
+        news = [
+            {"headline": "Company mission statement updated"},  # "miss" inside a word: neutral
+            {"headline": "Shares plunge after downgrade"},  # bearish
+            {"headline": "Stock falls as guidance misses estimates"},
+        ]  # bearish
         result = analyzer._analyze_sentiment(news)
         self.assertEqual((result["positive"], result["negative"], result["neutral"]), (0, 2, 1))
         self.assertEqual(result["label"], "Bearish")
@@ -94,14 +113,17 @@ class EarningsAndErrorsTests(unittest.TestCase):
     def test_upcoming_earnings_alert(self):
         candles = make_candles(100, 0.01, seed=6)
         date = (pd.Timestamp.now(tz="America/New_York") + pd.Timedelta(days=2)).strftime("%Y-%m-%d")
-        result = QuantitativeAnalyzer(THRESHOLDS).analyze(one_stock(candles), earnings={"X": {"date": date, "hour": "amc"}})
+        result = QuantitativeAnalyzer(THRESHOLDS).analyze(
+            one_stock(candles), earnings={"X": {"date": date, "hour": "amc"}}
+        )
         events = [a for a in result["X"]["alerts"] if a["kind"] == "event"]
         self.assertEqual(len(events), 1)
         self.assertIn("after the close", events[0]["text"])
 
     def test_missing_history_is_reported_not_raised(self):
         result = QuantitativeAnalyzer(THRESHOLDS).analyze(
-            {"X": {"quote": {}, "candles": pd.DataFrame(), "news": [], "premarket": {}}})
+            {"X": {"quote": {}, "candles": pd.DataFrame(), "news": [], "premarket": {}}}
+        )
         self.assertEqual(result["X"], {"error": "No price history returned"})
 
 
@@ -118,8 +140,10 @@ class PositioningTests(unittest.TestCase):
     def test_heavily_shorted_stock_gets_a_minor_alert(self):
         result = self.analyze(short_pct_float=29.4, short_ratio=7.6, short_change_pct=4.8)
         signal = next(t for t in result["triggers"] if t.startswith("Short interest"))
-        self.assertIn("29.4% of float (very high), 7.6 days to cover (high), +5% vs. prior report. A crowded short",
-                      signal)
+        self.assertIn(
+            "29.4% of float (very high), 7.6 days to cover (high), +5% vs. prior report. A crowded short",
+            signal,
+        )
         self.assertEqual(result["metrics"]["short_level"], "Very high")
         alerts = self.positioning(result)
         self.assertEqual(len(alerts), 1)
@@ -133,8 +157,12 @@ class PositioningTests(unittest.TestCase):
 
     def test_normal_short_interest_is_a_signal_only(self):
         result = self.analyze(short_pct_float=1.3, short_ratio=2.3)
-        self.assertTrue(any(t.startswith("Short interest 1.3% of float (low), 2.3 days to cover (moderate).")
-                            for t in result["triggers"]))
+        self.assertTrue(
+            any(
+                t.startswith("Short interest 1.3% of float (low), 2.3 days to cover (moderate).")
+                for t in result["triggers"]
+            )
+        )
         self.assertEqual(self.positioning(result), [])
 
     def test_level_boundaries(self):
@@ -150,8 +178,15 @@ class PositioningTests(unittest.TestCase):
 
     def test_call_heavy_options_lean_bullish(self):
         result = self.analyze(call_oi=60_000, put_oi=20_000, put_call_oi_ratio=1 / 3, options_window_days=30)
-        self.assertTrue(any(t.startswith("Open interest, next 30 days: 60K calls vs. 20K puts. "
-                                         "Put/call 0.33 (very bullish): call-heavy") for t in result["triggers"]))
+        self.assertTrue(
+            any(
+                t.startswith(
+                    "Open interest, next 30 days: 60K calls vs. 20K puts. "
+                    "Put/call 0.33 (very bullish): call-heavy"
+                )
+                for t in result["triggers"]
+            )
+        )
         self.assertIn("3.0 calls open for every put", self.positioning(result)[0]["text"])
 
     def test_put_heavy_options_lean_bearish(self):
@@ -171,8 +206,10 @@ class PositioningTests(unittest.TestCase):
 
     def test_most_calls_expiring_this_week_alerts(self):
         result = self.analyze(call_oi_week=133_410, call_oi_week_pct=64.3, week_end="2026-10-16")
-        self.assertIn("133K calls (64% of near-term calls) expire by Fri Oct 16 (monthly expiration)",
-                      result["triggers"])
+        self.assertIn(
+            "133K calls (64% of near-term calls) expire by Fri Oct 16 (monthly expiration)",
+            result["triggers"],
+        )
         alerts = self.positioning(result)
         self.assertEqual(len(alerts), 1)
         self.assertEqual(alerts[0]["direction"], "caution")
@@ -206,8 +243,14 @@ class PositioningTests(unittest.TestCase):
         result = self.analyze(total_debt_m=170, total_cash_m=30, operating_cashflow_m=-140)
         self.assertAlmostEqual(result["metrics"]["cash_runway_months"], 30 / 140 * 12)
         self.assertEqual(result["metrics"]["cash_runway_level"], "Short")
-        self.assertTrue(any(t.startswith("Burning $140M a year from operations: cash lasts ~3 months at that "
-                                         "rate (short)") for t in result["triggers"]))
+        self.assertTrue(
+            any(
+                t.startswith(
+                    "Burning $140M a year from operations: cash lasts ~3 months at that rate (short)"
+                )
+                for t in result["triggers"]
+            )
+        )
         alerts = [a for a in result["alerts"] if a["kind"] == "balance_sheet"]
         self.assertEqual(len(alerts), 1)
         self.assertIn("Cash runway ~3 months: $30M of cash, burning $140M a year", alerts[0]["text"])
@@ -227,16 +270,29 @@ class PositioningTests(unittest.TestCase):
         for fundamentals in ({"forward_eps": -1.5}, {"forward_pe": -113.4}):  # computed, and Yahoo's fallback
             result = self.analyze(**fundamentals)
             self.assertIsNone(result["metrics"]["forward_pe"])
-            self.assertIn("No forward P/E: analysts expect a loss over the next 12 months", result["triggers"])
+            self.assertIn(
+                "No forward P/E: analysts expect a loss over the next 12 months", result["triggers"]
+            )
 
 
 class RankingTests(unittest.TestCase):
     def test_stock_with_more_problems_ranks_first(self):
         results = {
-            "ONE": {"alerts": [{"text": "a", "direction": "down", "severity": 1.5, "kind": "move"}], "metrics": {}},
-            "MANY": {"alerts": [{"text": "b", "direction": "down", "severity": 1.4, "kind": "move"},
-                                {"text": "c", "direction": "down", "severity": 1.3, "kind": "volume"}], "metrics": {}},
-            "MINOR": {"alerts": [{"text": "d", "direction": "up", "severity": 0.6, "kind": "momentum"}], "metrics": {}},
+            "ONE": {
+                "alerts": [{"text": "a", "direction": "down", "severity": 1.5, "kind": "move"}],
+                "metrics": {},
+            },
+            "MANY": {
+                "alerts": [
+                    {"text": "b", "direction": "down", "severity": 1.4, "kind": "move"},
+                    {"text": "c", "direction": "down", "severity": 1.3, "kind": "volume"},
+                ],
+                "metrics": {},
+            },
+            "MINOR": {
+                "alerts": [{"text": "d", "direction": "up", "severity": 0.6, "kind": "momentum"}],
+                "metrics": {},
+            },
         }
         ranked = QuantitativeAnalyzer.rank_stocks(results, min_severity=1.0)
         self.assertEqual([r["symbol"] for r in ranked], ["MANY", "ONE"])  # MINOR stays off the header
@@ -251,14 +307,22 @@ class SessionTests(unittest.TestCase):
 
     def test_unfinished_daily_bar_is_dropped_until_4pm(self):
         from datetime import datetime
+
         from src.fetcher import MARKET_TZ, FinnhubFetcher
+
         candles = make_candles(100, 0.01, sessions=30, end="2026-10-01")
         morning = datetime(2026, 10, 1, 7, 50, tzinfo=MARKET_TZ)
         evening = datetime(2026, 10, 1, 18, 0, tzinfo=MARKET_TZ)
-        self.assertEqual(FinnhubFetcher.drop_unfinished_bar(candles, morning).index[-1].date().isoformat(), "2026-09-30")
-        self.assertEqual(FinnhubFetcher.drop_unfinished_bar(candles, evening).index[-1].date().isoformat(), "2026-10-01")
+        self.assertEqual(
+            FinnhubFetcher.drop_unfinished_bar(candles, morning).index[-1].date().isoformat(), "2026-09-30"
+        )
+        self.assertEqual(
+            FinnhubFetcher.drop_unfinished_bar(candles, evening).index[-1].date().isoformat(), "2026-10-01"
+        )
         yesterday_only = candles.iloc[:-1]
-        self.assertEqual(len(FinnhubFetcher.drop_unfinished_bar(yesterday_only, morning)), len(yesterday_only))
+        self.assertEqual(
+            len(FinnhubFetcher.drop_unfinished_bar(yesterday_only, morning)), len(yesterday_only)
+        )
 
     def test_after_hours_move_is_labeled_after_hours(self):
         candles = make_candles(100, 0.01, seed=7, last_return=0.0)
@@ -273,8 +337,10 @@ class MissingDataTests(unittest.TestCase):
     def test_trailing_row_without_prices_is_ignored(self):
         # Yahoo can add a price-less row (e.g. a dividend on a day that hasn't traded yet)
         candles = make_candles(100, 0.01, sessions=276, seed=8, end="2026-09-30")
-        blank = pd.DataFrame({"open": [np.nan], "high": [np.nan], "low": [np.nan], "close": [np.nan],
-                              "volume": [np.nan]}, index=[pd.Timestamp("2026-10-01")])
+        blank = pd.DataFrame(
+            {"open": [np.nan], "high": [np.nan], "low": [np.nan], "close": [np.nan], "volume": [np.nan]},
+            index=[pd.Timestamp("2026-10-01")],
+        )
         result = QuantitativeAnalyzer(THRESHOLDS).analyze(one_stock(pd.concat([candles, blank])))
         self.assertNotIn("error", result["X"])
         self.assertAlmostEqual(result["X"]["metrics"]["last_close"], float(candles["close"].iloc[-1]))

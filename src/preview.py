@@ -1,9 +1,8 @@
 """
-PDF Preview Image
+Renders the newsletter's first page to a PNG.
 
-Turns the cover page of the newsletter PDF into a PNG. GitHub can't embed a PDF in a README,
-but it can show an image, so the workflow publishes this next to the PDF and the README links
-one to the other.
+GitHub READMEs can't embed a PDF but can show an image, so the workflow publishes this
+thumbnail next to the PDF and the README links one to the other.
 
 Usage: python -m src.preview output/premarket_<date>.pdf latest.png
 """
@@ -16,6 +15,7 @@ import pypdfium2 as pdfium
 def render_preview(pdf_path: str, png_path: str, dpi: int = 110) -> str:
     pdf = pdfium.PdfDocument(pdf_path)
     try:
+        # PDF units are points (1/72 inch), so scale = dpi / 72.
         image = pdf[0].render(scale=dpi / 72).to_pil()
     finally:
         pdf.close()

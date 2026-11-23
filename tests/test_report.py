@@ -1,4 +1,5 @@
 """Tests for the email formatter, the PDF, and the dispatcher (no network, nothing is sent)."""
+
 import os
 import smtplib
 import tempfile
@@ -9,7 +10,7 @@ import pandas as pd
 
 from src.analyzer import QuantitativeAnalyzer
 from src.dispatcher import EmailDispatcher, parse_recipients
-from src.formatter import ReportFormatter, fmt_market_cap, fmt_pct, fmt_volume
+from src.formatter import ReportFormatter, _most_common_session, fmt_market_cap, fmt_pct, fmt_volume
 from tests.fixtures import sample_earnings, sample_market, sample_movers, sample_pipeline
 from tests.test_analyzer import THRESHOLDS
 
@@ -31,15 +32,15 @@ class FormatterTests(unittest.TestCase):
 
     def test_outside_text_is_escaped_and_bad_links_dropped(self):
         html = self.formatter.render_html(self.ctx)
-        self.assertIn("&lt;b&gt;AAA&lt;/b&gt;", html)      # headline markup shown as text
+        self.assertIn("&lt;b&gt;AAA&lt;/b&gt;", html)  # headline markup shown as text
         self.assertNotIn("<b>AAA</b>", html)
-        self.assertNotIn("javascript:", html)              # unsafe link removed
+        self.assertNotIn("javascript:", html)  # unsafe link removed
         self.assertIn("href='https://example.com/news/1'", html)
 
     def test_header_lists_flagged_stocks_and_errors(self):
         html = self.formatter.render_html(self.ctx)
         self.assertIn("Big &amp; concerning moves", html)
-        self.assertIn("No price history returned", html)    # ZZZ shown, not silently dropped
+        self.assertIn("No price history returned", html)  # ZZZ shown, not silently dropped
         self.assertEqual(self.ctx["ranked"][0]["symbol"], "AAA")
 
     def test_subject_names_top_movers(self):
@@ -67,14 +68,20 @@ class FormatterTests(unittest.TestCase):
         self.assertIn("Put/call ratio", html)
 
     def test_positioning_guide_follows_config(self):
-        guide = dict(ReportFormatter({}, {**THRESHOLDS, "short_interest_levels_pct": [4, 8, 15]}).positioning_guide())
+        guide = dict(
+            ReportFormatter({}, {**THRESHOLDS, "short_interest_levels_pct": [4, 8, 15]}).positioning_guide()
+        )
         ranges = [(r, name) for r, name, _ in guide["Short interest (% of float)"]]
-        self.assertEqual(ranges, [("under 4%", "Low"), ("4%–8%", "Moderate"), ("8%–15%", "High"),
-                                  ("15% and up", "Very high")])
+        self.assertEqual(
+            ranges,
+            [("under 4%", "Low"), ("4%–8%", "Moderate"), ("8%–15%", "High"), ("15% and up", "Very high")],
+        )
         self.assertEqual(len(guide["Put/call open interest"]), 5)
         text = self.formatter.render_text(self.ctx)
         self.assertIn("READING SHORT INTEREST, OPTIONS AND CASH RUNWAY", text)
-        self.assertEqual([name for _, name, _ in guide["Cash runway (months)"]], ["Short", "Moderate", "Long"])
+        self.assertEqual(
+            [name for _, name, _ in guide["Cash runway (months)"]], ["Short", "Moderate", "Long"]
+        )
         self.assertIn("not how fast the business is growing", text)
         self.assertIn("Reading short interest, options and cash runway", self.formatter.render_html(self.ctx))
 
@@ -88,7 +95,9 @@ class FormatterTests(unittest.TestCase):
 class PdfTests(unittest.TestCase):
     def test_pdf_has_header_page_stock_pages_and_guide_page(self):
         from pypdf import PdfReader
+
         from src.pdf_report import NewsletterPDF
+
         formatter, ctx, pipeline = build_report()
         with tempfile.TemporaryDirectory() as tmp:
             path = NewsletterPDF(formatter).build(ctx, pipeline, os.path.join(tmp, "report.pdf"))
@@ -102,8 +111,10 @@ class PdfTests(unittest.TestCase):
 
     def test_preview_shows_first_page_only(self):
         from PIL import Image
+
         from src.pdf_report import NewsletterPDF
         from src.preview import render_preview
+
         formatter, ctx, pipeline = build_report()
         with tempfile.TemporaryDirectory() as tmp:
             pdf = NewsletterPDF(formatter).build(ctx, pipeline, os.path.join(tmp, "report.pdf"))
@@ -129,7 +140,7 @@ class DispatcherTests(unittest.TestCase):
             os.unlink(f.name)
         raw = msg.as_string()
         self.assertEqual(msg["To"], "me@gmail.com")
-        self.assertNotIn("a@x.com", raw)          # no recipient address anywhere in the headers/body
+        self.assertNotIn("a@x.com", raw)  # no recipient address anywhere in the headers/body
         self.assertIsNone(msg["Bcc"])
         types = [part.get_content_type() for part in msg.walk()]
         self.assertIn("text/plain", types)
@@ -140,10 +151,18 @@ class DispatcherTests(unittest.TestCase):
         sent = {}
 
         class FakeSMTP:
-            def __init__(self, *args, **kwargs): pass
-            def __enter__(self): return self
-            def __exit__(self, *exc): return False
-            def login(self, user, password): sent["login"] = (user, password)
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def login(self, user, password):
+                sent["login"] = (user, password)
+
             def send_message(self, msg, from_addr=None, to_addrs=None):
                 sent["to"] = to_addrs
                 return {}
@@ -155,10 +174,17 @@ class DispatcherTests(unittest.TestCase):
 
     def test_send_reports_bad_login(self):
         class FailingSMTP:
-            def __init__(self, *args, **kwargs): pass
-            def __enter__(self): return self
-            def __exit__(self, *exc): return False
-            def login(self, user, password): raise smtplib.SMTPAuthenticationError(535, b"bad")
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def login(self, user, password):
+                raise smtplib.SMTPAuthenticationError(535, b"bad")
 
         dispatcher = EmailDispatcher("me@gmail.com", "pw", ["a@x.com"])
         with mock.patch.object(smtplib, "SMTP_SSL", FailingSMTP):
@@ -174,9 +200,34 @@ class SessionLabelTests(unittest.TestCase):
         formatter, ctx, _ = build_report()
         for stock in ctx["stocks"]:
             stock["metrics"]["premarket_session"] = "after-hours"
-        ctx = formatter.build_context({s["symbol"]: {k: v for k, v in s.items() if k != "symbol"} for s in ctx["stocks"]},
-                                      ctx["ranked"], ctx["market"], ctx["movers"], ctx["generated_at"])
+        ctx = formatter.build_context(
+            {s["symbol"]: {k: v for k, v in s.items() if k != "symbol"} for s in ctx["stocks"]},
+            ctx["ranked"],
+            ctx["market"],
+            ctx["movers"],
+            ctx["generated_at"],
+        )
         html = formatter.render_html(ctx)
         self.assertIn("After-hrs", html)
         self.assertIn("after-hours price vs. today", html)
         self.assertNotIn(">Pre-mkt<", html)
+
+    def test_session_ties_go_to_the_later_session(self):
+        # Previously decided by set iteration order, which varies with string hash seeds.
+        self.assertEqual(_most_common_session(["pre-market", "regular"]), "regular")
+        self.assertEqual(_most_common_session(["regular", "pre-market"]), "regular")
+        self.assertEqual(_most_common_session(["after-hours", "regular", "regular"]), "regular")
+        self.assertEqual(_most_common_session([]), "pre-market")
+
+
+class HeadlineDateTests(unittest.TestCase):
+    def test_headline_dates_use_new_york_time(self):
+        formatter, ctx, _ = build_report()
+        # 01:30 UTC on Oct 2 is 9:30 PM ET on Oct 1; a UTC runner used to print "Oct 2".
+        late_evening = int(pd.Timestamp("2026-10-02 01:30", tz="UTC").timestamp())
+        ctx["stocks"][0]["top_news"] = [
+            {"headline": "Late story", "source": "Wire", "datetime": late_evening}
+        ]
+        html = formatter.render_html(ctx)
+        self.assertIn("Wire · Oct 1", html)
+        self.assertNotIn("Wire · Oct 2", html)

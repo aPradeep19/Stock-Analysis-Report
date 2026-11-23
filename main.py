@@ -1,13 +1,12 @@
 """
-Pipeline entry point
---------------------
-Runs the whole morning job in order:
+Pipeline entry point. Runs the morning job end to end:
 
-  1. Fetch    (src/fetcher.py)    prices, pre-market trades, news, fundamentals, short interest, options,
-                                  institutional ownership, earnings, market
-  2. Analyze  (src/analyzer.py)   indicators -> signals -> ranked alerts
-  3. Format   (src/formatter.py, src/pdf_report.py)   email HTML + text + PDF newsletter
-  4. Dispatch (src/dispatcher.py) Gmail SMTP to the recipient list
+  1. Fetch     src/fetcher.py      prices, pre-market trades, news, fundamentals, short interest,
+                                   options, ownership, earnings, market backdrop
+  2. Analyze   src/analyzer.py     indicators -> signals -> ranked alerts
+  3. Format    src/formatter.py    email HTML + plain text
+               src/pdf_report.py   PDF newsletter
+  4. Dispatch  src/dispatcher.py   Gmail SMTP to the recipient list
 
 Usage:
   python main.py              fetch, analyze, build the report, and email it
@@ -29,12 +28,12 @@ from src.fetcher import MARKET_TZ, FinnhubFetcher
 from src.formatter import ReportFormatter, fmt_pct
 
 OUTPUT_DIR = "output"
-MARKET_SYMBOLS = ["SPY", "QQQ"]   # benchmarks that get a pre-market gap
-VIX_SYMBOL = "^VIX"               # volatility index (daily close only)
+MARKET_SYMBOLS = ["SPY", "QQQ"]  # benchmarks that also get a pre-market gap
+VIX_SYMBOL = "^VIX"  # daily close only; it doesn't trade pre-market
 
 
 def load_config(filepath: str = "config.yaml") -> dict:
-    """Reads configuration safely. Fails fast if the file is absent or malformed."""
+    """Loads config.yaml, failing fast with a clear message if it's missing."""
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"Configuration file not found at '{filepath}'")
 
@@ -51,11 +50,10 @@ def parse_args():
 
 def safe_call(label: str, func, default):
     """
-    Runs one API call and returns `default` if it fails.
+    Runs one fetch and returns `default` if it raises.
 
-    Why: the report has ~5 data sources per stock. If Finnhub's fundamentals endpoint hiccups
-    for one ticker, that ticker's page should show "—" for market cap, not crash the whole run
-    and leave everyone without a morning email.
+    Each stock pulls from ~5 sources. One flaky endpoint for one ticker should leave a "—" on
+    that ticker's page, not kill the run and leave everyone without a morning email.
     """
     try:
         return func()
@@ -64,14 +62,20 @@ def safe_call(label: str, func, default):
         return default
 
 
-def fetch_symbol(fetcher: FinnhubFetcher, symbol: str, use_finnhub: bool, days_back: int,
-                 options_days: int = 30) -> dict:
+def fetch_symbol(
+    fetcher: FinnhubFetcher, symbol: str, use_finnhub: bool, days_back: int, options_days: int = 30
+) -> dict:
+    """Everything the analyzer needs for one ticker. Finnhub calls are skipped without a key."""
     data = {
-        # yfinance (no key needed)
-        "candles": safe_call(f"{symbol} price history", lambda: fetcher.get_historical_candles(symbol, days_back),
-                             pd.DataFrame()),
+        # yfinance needs no key, so these always run.
+        "candles": safe_call(
+            f"{symbol} price history",
+            lambda: fetcher.get_historical_candles(symbol, days_back),
+            pd.DataFrame(),
+        ),
         "premarket": safe_call(f"{symbol} pre-market", lambda: fetcher.get_premarket_snapshot(symbol), {}),
-        "quote": {}, "news": [],
+        "quote": {},
+        "news": [],
     }
     yahoo = safe_call(f"{symbol} Yahoo fundamentals", lambda: fetcher.get_yahoo_fundamentals(symbol), {})
     options = safe_call(f"{symbol} options", lambda: fetcher.get_options_interest(symbol, options_days), {})
@@ -81,9 +85,10 @@ def fetch_symbol(fetcher: FinnhubFetcher, symbol: str, use_finnhub: bool, days_b
         data["news"] = safe_call(f"{symbol} news", lambda: fetcher.get_recent_news(symbol, days_back=3), [])
         profile = safe_call(f"{symbol} profile", lambda: fetcher.get_company_profile(symbol), {})
         metrics = safe_call(f"{symbol} fundamentals", lambda: fetcher.get_key_metrics(symbol), {})
-    # Later sources overwrite earlier ones, but only with real values. So Finnhub's numbers win
-    # and Yahoo fills the gaps (e.g. on a dry run with no key). Forward P/E, short interest and
-    # options only come from Yahoo.
+
+    # Later sources overwrite earlier ones, but only with non-None values: Finnhub wins where it
+    # has data and Yahoo fills the gaps (e.g. a dry run with no key). Forward P/E, short interest
+    # and options only exist on the Yahoo side.
     fundamentals = {}
     for source in (yahoo, options, profile, metrics):
         fundamentals.update({k: v for k, v in source.items() if v is not None})
@@ -94,7 +99,6 @@ def fetch_symbol(fetcher: FinnhubFetcher, symbol: str, use_finnhub: bool, days_b
 def main():
     args = parse_args()
 
-    # 1. Load parameters
     config = load_config()
     watchlist = [s.upper() for s in config.get("watchlist", [])]
     thresholds = config.get("analysis_thresholds", {})
@@ -105,7 +109,7 @@ def main():
         print("[ERROR] Watchlist is empty. Define tickers inside config.yaml.")
         sys.exit(1)
 
-    # 2. Credentials from environment variables (never hardcoded, never committed)
+    # Secrets only ever come from the environment (GitHub Actions secrets in CI).
     api_key = os.environ.get("FINNHUB_API_KEY")
     if not api_key and not args.dry_run:
         print("[ERROR] Missing required environment variable 'FINNHUB_API_KEY'.")
@@ -113,53 +117,74 @@ def main():
         print("Or add it under GitHub Repository Settings -> Secrets and variables -> Actions.")
         sys.exit(1)
     if not api_key:
-        print("[WARN] No FINNHUB_API_KEY: dry run continues with Yahoo data only (no news or earnings dates).")
+        print(
+            "[WARN] No FINNHUB_API_KEY: dry run continues with Yahoo data only (no news or earnings dates)."
+        )
 
     fetcher = FinnhubFetcher(api_key=api_key)
     analyzer = QuantitativeAnalyzer(thresholds)
     now = datetime.now(MARKET_TZ)
 
-    # 3. Fetch every ticker. ~500 calendar days = ~340 sessions: enough for a 200-day average
-    #    across the whole 6-month chart AND a full 52-week range.
+    # ~500 calendar days is ~340 sessions: enough for the 200-day average to span the whole
+    # 6-month chart, plus a full 52-week range.
     print(f"[*] Beginning ingestion cycle for {len(watchlist)} tickers...\n")
     pipeline_data = {}
     for symbol in watchlist:
         print(f"--> Fetching market data for: {symbol}")
-        pipeline_data[symbol] = fetch_symbol(fetcher, symbol, bool(api_key), days_back=500,
-                                             options_days=thresholds.get("options_window_days", 30))
+        pipeline_data[symbol] = fetch_symbol(
+            fetcher,
+            symbol,
+            bool(api_key),
+            days_back=500,
+            options_days=thresholds.get("options_window_days", 30),
+        )
 
     print("--> Fetching market backdrop (SPY, QQQ, VIX)")
     market_raw = {}
     for symbol in MARKET_SYMBOLS:
         market_raw[symbol] = {
-            "candles": safe_call(f"{symbol} history", lambda s=symbol: fetcher.get_historical_candles(s, 60), pd.DataFrame()),
-            "premarket": safe_call(f"{symbol} pre-market", lambda s=symbol: fetcher.get_premarket_snapshot(s), {}),
+            "candles": safe_call(
+                f"{symbol} history", lambda s=symbol: fetcher.get_historical_candles(s, 60), pd.DataFrame()
+            ),
+            "premarket": safe_call(
+                f"{symbol} pre-market", lambda s=symbol: fetcher.get_premarket_snapshot(s), {}
+            ),
         }
     market_raw[VIX_SYMBOL] = {
-        "candles": safe_call("VIX history", lambda: fetcher.get_historical_candles(VIX_SYMBOL, 30), pd.DataFrame()),
+        "candles": safe_call(
+            "VIX history", lambda: fetcher.get_historical_candles(VIX_SYMBOL, 30), pd.DataFrame()
+        ),
         "premarket": {},
     }
 
     earnings = {}
     if api_key:
         print("--> Checking the earnings calendar")
-        earnings = safe_call("earnings calendar", lambda: fetcher.get_upcoming_earnings(
-            watchlist, days_ahead=thresholds.get("earnings_lookahead_days", 7) + 7), {})
+        # Look a week past the alert window so stock pages can still show the next date even
+        # when it's too far out to raise an alert.
+        earnings = safe_call(
+            "earnings calendar",
+            lambda: fetcher.get_upcoming_earnings(
+                watchlist, days_ahead=thresholds.get("earnings_lookahead_days", 7) + 7
+            ),
+            {},
+        )
 
     movers = {}
     if movers_cfg.get("enabled", True):
         print("--> Scanning market movers")
         movers = safe_call("market movers", lambda: fetcher.get_market_movers(movers_cfg.get("count", 5)), {})
 
-    # 4. Is the market open today? If nothing traded pre-market, it's a weekend or holiday.
-    traded = [d["premarket"].get("traded_today") for d in list(pipeline_data.values()) + list(market_raw.values())]
+    # No trades today anywhere means a weekend or market holiday, so there's nothing to report.
+    traded = [
+        d["premarket"].get("traded_today") for d in list(pipeline_data.values()) + list(market_raw.values())
+    ]
     if not any(traded):
         print(f"\n[i] No trades found for {now:%A %b %d}: market closed (weekend/holiday) or before 4 AM ET.")
         if not (args.force or args.dry_run):
             print("    Skipping today's email. Use --force to send anyway.")
             return
 
-    # 5. Analyze
     print("\n[*] Running quantitative analysis...")
     market = analyzer.analyze_market(market_raw)
     results = analyzer.analyze(pipeline_data, market, earnings)
@@ -167,14 +192,16 @@ def main():
 
     print(f"  └─ {len(ranked)} of {len(results)} stocks need attention:")
     for item in ranked:
-        print(f"     [{item['symbol']}] {fmt_pct(item.get('gap_pct'))} vs. last close · score {item['score']}")
+        print(
+            f"     [{item['symbol']}] {fmt_pct(item.get('gap_pct'))} vs. last close · score {item['score']}"
+        )
         for alert in item["alerts"]:
             print(f"        - {alert['text']}")
     for symbol, result in results.items():
         if "error" in result:
             print(f"     [{symbol}] skipped: {result['error']}")
 
-    # 6. Format: email + PDF, saved to output/ so every run leaves a preview behind
+    # Everything is written to output/ as well, so every run leaves a preview behind.
     formatter = ReportFormatter(report_cfg, thresholds)
     ctx = formatter.build_context(results, ranked, market, movers, now)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -182,12 +209,14 @@ def main():
 
     pdf_path = None
     if report_cfg.get("attach_pdf", True):
+        # Imported inside the try so a reportlab/matplotlib problem only costs the attachment;
+        # the email itself still goes out.
         try:
             from src.pdf_report import NewsletterPDF
+
             pdf_path = NewsletterPDF(formatter).build(ctx, pipeline_data, f"{stem}.pdf")
             print(f"\n[✓] PDF newsletter: {pdf_path}")
         except Exception as e:
-            # A broken PDF should never block the email itself
             print(f"\n[WARN] PDF build failed, sending without it: {e}")
             pdf_path = None
 
@@ -205,7 +234,6 @@ def main():
         print("\n[i] Dry run: nothing was sent. Open the files above to preview the report.")
         return
 
-    # 7. Dispatch
     sender = os.environ.get("SENDER_EMAIL")
     password = os.environ.get("EMAIL_PASSWORD")
     recipients = parse_recipients(os.environ.get("RECIPIENT_EMAILS", ""))
@@ -214,10 +242,12 @@ def main():
         print("        or run with --dry-run to build the report without sending it.")
         sys.exit(1)
 
-    dispatcher = EmailDispatcher(sender, password, recipients, sender_name=report_cfg.get("title", "Pre-Market Brief"))
+    dispatcher = EmailDispatcher(
+        sender, password, recipients, sender_name=report_cfg.get("title", "Pre-Market Brief")
+    )
     sent = dispatcher.send(subject, html_body, text_body, attachments=[pdf_path] if pdf_path else [])
     if not sent:
-        sys.exit(1)  # makes the GitHub Actions run fail, which emails you about it
+        sys.exit(1)  # fails the GitHub Actions run, which notifies the repo owner
 
     print("\n[✓] Pipeline execution finished.")
 

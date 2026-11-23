@@ -1,14 +1,25 @@
-import time
-import requests
-import pandas as pd
-from datetime import datetime, timedelta, time as clock_time
-from zoneinfo import ZoneInfo
-import yfinance as yf
+"""
+Market data access.
 
+Finnhub (free tier) supplies quotes, news, company profiles, a few fundamentals and the earnings
+calendar. Everything Finnhub's free tier lacks or gets wrong comes from yfinance instead: daily
+price history, extended-hours trades, forward estimates, short interest, options open interest,
+balance-sheet figures and the market-mover screens.
+"""
+
+import time
+from datetime import datetime, timedelta
+from datetime import time as clock_time
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+import requests
+import yfinance as yf
 
 MARKET_TZ = ZoneInfo("America/New_York")
 REGULAR_OPEN = clock_time(9, 30)
 REGULAR_CLOSE = clock_time(16, 0)
+
 
 class FinnhubFetcher:
     def __init__(self, api_key: str):
@@ -18,34 +29,29 @@ class FinnhubFetcher:
     def _get(self, endpoint: str, params: dict = None) -> dict:
         if params is None:
             params = {}
-            
         params["token"] = self.api_key
-        
-        response = requests.get(
-            f"{self.base_url}{endpoint}",
-            params=params,
-            timeout=10
-        )
-        
+
+        response = requests.get(f"{self.base_url}{endpoint}", params=params, timeout=10)
+
+        # The free tier allows 60 calls/minute; waiting out the window is simpler than queueing.
         if response.status_code == 429:
             print("\n[WARN] Rate limit reached. Sleeping for 60 seconds...")
             time.sleep(60)
             return self._get(endpoint, params)
-            
+
         response.raise_for_status()
         return response.json()
 
+    # ------------------------------------------------------------------ #
+    # Prices
+    # ------------------------------------------------------------------ #
     def get_quote(self, symbol: str) -> dict:
         """
-        Retrieves real-time/latest end-of-day price action.
-        
-        Finnhub keys:
-          'c': Current close/last price
-          'd': Dollar change
-          'dp': Percentage change
-          'h': Daily High, 'l': Daily Low, 'o': Daily Open, 'pc': Previous Close
+        Latest regular-session quote from Finnhub.
+
+        Finnhub's short keys: c = last price, d = $ change, dp = % change,
+        h/l/o = day high/low/open, pc = previous close.
         """
-        
         data = self._get("/quote", {"symbol": symbol})
         return {
             "current_price": data.get("c"),
@@ -54,52 +60,51 @@ class FinnhubFetcher:
             "high": data.get("h"),
             "low": data.get("l"),
             "open": data.get("o"),
-            "prev_close": data.get("pc")
+            "prev_close": data.get("pc"),
         }
 
     def get_historical_candles(self, symbol: str, days_back: int = 90) -> pd.DataFrame:
         """
-        Fetches daily OHLCV bars using yfinance to bypass Finnhub's paywall.
-        Returns a clean Datetime-indexed pandas DataFrame.
-        """
+        Daily OHLCV bars from yfinance (Finnhub's candle endpoint is paywalled).
 
+        Returns a tz-naive, date-indexed DataFrame with lowercase columns, or an empty
+        DataFrame on any failure.
+        """
         try:
             ticker = yf.Ticker(symbol)
 
-            # Use a date range in New York time. yfinance's `end` is exclusive, so tomorrow's
-            # date is needed to include today's bar (dropped below if today isn't finished).
+            # yfinance's `end` is exclusive, so ask for tomorrow to include today's bar.
+            # drop_unfinished_bar() removes it again if the session hasn't closed yet.
             now = datetime.now(MARKET_TZ)
             end_date = now.date() + timedelta(days=1)
             start_date = now.date() - timedelta(days=days_back)
 
             df = ticker.history(start=start_date.strftime("%Y-%m-%d"), end=end_date.strftime("%Y-%m-%d"))
-            
             if df.empty:
                 return pd.DataFrame()
-                
-            # yfinance capitalizes column names. Lowercase them to match our analyzer's expectations.
-            df = df.rename(columns={
-                "Open": "open",
-                "High": "high",
-                "Low": "low",
-                "Close": "close",
-                "Volume": "volume"
-            })
 
+            df = df.rename(
+                columns={
+                    "Open": "open",
+                    "High": "high",
+                    "Low": "low",
+                    "Close": "close",
+                    "Volume": "volume",
+                }
+            )
             df = df[["open", "high", "low", "close", "volume"]]
 
-            # Yahoo sometimes returns a row with no prices, e.g. a dividend dated on a day the
-            # stock hasn't traded yet. A bar without a close can't be analyzed, so drop it, and
-            # fill any missing high/low/open from the close so comparisons never hit a blank.
+            # Yahoo occasionally emits a price-less row (e.g. a dividend dated on a day that hasn't
+            # traded yet). Without a close it's useless, so drop it, and backfill any missing
+            # open/high/low from the close so downstream comparisons never see NaN.
             df = df.dropna(subset=["close"])
             for column in ("open", "high", "low"):
                 df[column] = df[column].fillna(df["close"])
             df["volume"] = df["volume"].fillna(0)
-            # Slice off timezone info
             df.index = df.index.tz_localize(None)
 
             return self.drop_unfinished_bar(df.sort_index(), now)
-            
+
         except Exception as e:
             print(f"[WARN] Failed to fetch historical data for {symbol} via yfinance: {e}")
             return pd.DataFrame()
@@ -107,64 +112,41 @@ class FinnhubFetcher:
     @staticmethod
     def drop_unfinished_bar(df: pd.DataFrame, now: datetime) -> pd.DataFrame:
         """
-        Today's daily bar keeps changing until the 4 PM close. Dropping it before then means
-        "last close" always refers to a finished session:
-          - 8:00 AM run  -> last close = yesterday (the pre-market gap is measured from it)
-          - 2:00 PM run  -> last close = yesterday (the move "so far today" is measured from it)
-          - 6:00 PM run  -> last close = today's 4 PM close (the after-hours move is measured from it)
+        Drops today's bar until the 4 PM close, so "last close" always means a finished session:
+          - 8:00 AM run -> yesterday's close (the pre-market gap is measured from it)
+          - 2:00 PM run -> yesterday's close (the move "so far today" is measured from it)
+          - 6:00 PM run -> today's close (the after-hours move is measured from it)
         """
         if not df.empty and df.index[-1].date() == now.date() and now.time() < REGULAR_CLOSE:
             return df.iloc[:-1]
         return df
 
-    def get_recent_news(self, symbol: str, days_back: int = 3) -> list:
-        """
-        Pulls recent company-specific headlines and links to serve as catalysts.
-        """
-
-        end_date = datetime.now().strftime("%Y-%m-%d")
-        start_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-        
-        data = self._get("/company-news", {
-            "symbol": symbol,
-            "from": start_date,
-            "to": end_date
-        })
-        
-        # Finnhub usually returns newest first, but we sort explicitly so the report never
-        # leads with a stale headline. 'datetime' is a Unix timestamp (seconds).
-        data = sorted(data, key=lambda article: article.get("datetime", 0), reverse=True)
-
-        # Return the 10 most recent articles
-        return [{
-            "headline": article.get("headline"),
-            "url": article.get("url"),
-            "summary": article.get("summary"),
-            "source": article.get("source"),
-            "datetime": article.get("datetime"),
-        } for article in data[:10]]
-
     def get_premarket_snapshot(self, symbol: str) -> dict:
         """
-        Returns the latest price traded *today*, including pre-market trades.
+        Latest price traded *today*, including extended hours.
 
-        Why not Finnhub's /quote? Its free tier only tracks the regular 9:30-4:00 session,
-        so at 8 AM its 'c' value is still yesterday's close. Yahoo's 1-minute bars with
-        prepost=True include extended-hours trades (pre-market runs 4:00-9:30 AM ET).
+        Finnhub's free /quote only tracks the 9:30-4:00 session, so at 8 AM it still shows
+        yesterday's close. Yahoo's 1-minute bars with prepost=True include pre-market trades
+        (4:00-9:30 AM ET).
 
-        Returned keys:
-          'price':            last traded price today (None if nothing traded yet today)
-          'as_of':            timestamp of that trade, in New York time
-          'session':          "pre-market", "regular", or "after-hours"
-          'premarket_volume': shares traded today before 9:30 AM
-          'traded_today':     False on weekends/holidays -> main.py uses this to skip the email
+        Returns:
+          price             last traded price today (None if nothing has traded yet)
+          as_of             timestamp of that trade, New York time
+          session           "pre-market", "regular" or "after-hours"
+          premarket_volume  shares traded today before 9:30 AM
+          traded_today      False on weekends/holidays; main.py uses it to skip the email
         """
-        empty = {"price": None, "as_of": None, "session": None,
-                 "premarket_volume": None, "traded_today": False}
+        empty = {
+            "price": None,
+            "as_of": None,
+            "session": None,
+            "premarket_volume": None,
+            "traded_today": False,
+        }
 
         try:
-            # period="5d" instead of "1d": right around 4 AM, Yahoo's "1d" window can still
-            # point at yesterday. Pulling a few days and filtering to today's date is safer.
+            # Around 4 AM, Yahoo's "1d" window can still point at yesterday, so pull a few days
+            # and filter to today ourselves.
             bars = yf.Ticker(symbol).history(period="5d", interval="1m", prepost=True)
         except Exception as e:
             print(f"[WARN] Failed to fetch pre-market data for {symbol} via yfinance: {e}")
@@ -173,8 +155,8 @@ class FinnhubFetcher:
         if bars.empty:
             return empty
 
-        # Convert every bar's timestamp to New York time so "today" and "before 9:30" mean
-        # the same thing whether this runs on your laptop or on GitHub's servers.
+        # Normalize to New York time so "today" and "before 9:30" mean the same thing whether
+        # this runs locally or on GitHub's UTC runners.
         index = bars.index
         index = index.tz_localize(MARKET_TZ) if index.tz is None else index.tz_convert(MARKET_TZ)
         bars = bars.set_axis(index)
@@ -182,7 +164,7 @@ class FinnhubFetcher:
         today = datetime.now(MARKET_TZ).date()
         todays_bars = bars[bars.index.date == today]
         if todays_bars.empty:
-            return empty  # Weekend, market holiday, or it's before 4 AM
+            return empty  # weekend, holiday, or before 4 AM
 
         last_ts = todays_bars.index[-1]
         if last_ts.time() < REGULAR_OPEN:
@@ -202,68 +184,105 @@ class FinnhubFetcher:
             "traded_today": True,
         }
 
+    # ------------------------------------------------------------------ #
+    # News and company data
+    # ------------------------------------------------------------------ #
+    def get_recent_news(self, symbol: str, days_back: int = 3) -> list:
+        """The 10 most recent company headlines, newest first."""
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+
+        data = self._get("/company-news", {"symbol": symbol, "from": start_date, "to": end_date})
+
+        # Finnhub is usually newest-first already, but not guaranteed, and leading with a stale
+        # headline would be misleading. 'datetime' is a Unix timestamp in seconds.
+        data = sorted(data, key=lambda article: article.get("datetime", 0), reverse=True)
+
+        return [
+            {
+                "headline": article.get("headline"),
+                "url": article.get("url"),
+                "summary": article.get("summary"),
+                "source": article.get("source"),
+                "datetime": article.get("datetime"),
+            }
+            for article in data[:10]
+        ]
+
     def get_key_metrics(self, symbol: str) -> dict:
         """
-        Pulls company fundamentals for each stock's section of the report (and its PDF page later).
+        A few fundamentals from Finnhub's free /stock/metric endpoint.
 
-        Finnhub's /stock/metric endpoint is on the free tier. It returns ~100 fields; we keep the
-        handful a reader actually scans. Field names vary slightly between companies, so every
-        lookup uses .get() and the formatter shows "—" for anything missing.
+        It returns ~100 fields whose names vary a little between companies, so every lookup is
+        a .get() and the formatter shows "—" for anything missing.
         """
         data = self._get("/stock/metric", {"symbol": symbol, "metric": "all"})
-        metric = data.get("metric", {}) 
+        metric = data.get("metric", {})
         return {
-            # Finnhub reports market cap in millions of dollars
-            "market_cap_m": metric.get("marketCapitalization"),
+            "market_cap_m": metric.get("marketCapitalization"),  # Finnhub reports this in $ millions
             "beta": metric.get("beta"),
-            "dividend_yield": metric.get("currentDividendYieldTTM", metric.get("dividendYieldIndicatedAnnual")),
+            "dividend_yield": metric.get(
+                "currentDividendYieldTTM", metric.get("dividendYieldIndicatedAnnual")
+            ),
+        }
+
+    def get_company_profile(self, symbol: str) -> dict:
+        """Name and industry, so the report can say "NVIDIA Corp · Semiconductors" rather than just "NVDA"."""
+        data = self._get("/stock/profile2", {"symbol": symbol})
+        return {
+            "name": data.get("name"),
+            "industry": data.get("finnhubIndustry"),
+            "market_cap_m": data.get("marketCapitalization"),
         }
 
     def get_yahoo_fundamentals(self, symbol: str) -> dict:
         """
-        Forward earnings and short interest from Yahoo (no key needed; Finnhub's free tier has neither).
+        Forward earnings, short interest, ownership and balance-sheet figures from Yahoo.
 
-        'forward_eps' is the analysts' consensus EPS for the NEXT 12 MONTHS (see blend_ntm_eps);
-        the analyzer divides the last close by it to get the forward P/E. Yahoo's own 'forwardPE'
-        isn't used when we can avoid it: it divides by next *fiscal year's* EPS, which can be up to
-        two years out (NVDA in October -> the year ending January 2028), so for a growing company it
-        reads too low. Its 'forwardEps' is also sometimes stale (it disagreed with Yahoo's own
-        estimates table for RDDT). It's kept only as a fallback when there are no estimates.
+        Forward EPS:
+          'forward_eps' is consensus EPS for the next twelve months (see blend_ntm_eps); the
+          analyzer divides the last close by it. Yahoo's own 'forwardPE' is only a fallback for
+          when there are no estimates: it divides by the next *fiscal year's* EPS, which can be
+          nearly two years out (NVDA in October -> the year ending January 2028), so it reads too
+          low for growing companies. Its 'forwardEps' has also been seen disagreeing with Yahoo's
+          own estimates table (RDDT).
 
-        Short interest is reported by exchanges twice a month, so it lags by up to ~2 weeks.
-          'short_pct_float':  shares sold short as a % of the tradable float
-          'short_ratio':      "days to cover": shares short / average daily volume
-          'short_change_pct': change vs. the prior report, so a growing short position stands out
+        Short interest (exchange-reported twice a month, so up to ~2 weeks stale):
+          short_pct_float   shares short as a % of the tradable float
+          short_ratio       days to cover: shares short / average daily volume
+          short_change_pct  change vs. the prior report
 
-        'institutional_pct' is the % of shares outstanding held by institutions (funds, banks,
-        pensions), built from their quarterly 13F filings.
+        'institutional_pct' is the % of shares held by institutions, from quarterly 13F filings.
 
-        Debt and cash come from the latest quarterly balance sheet; operating cash flow is the last
-        12 months. The analyzer turns them into net debt and, for companies burning cash, a runway.
-        Yahoo's own 'freeCashflow' isn't used: it's computed oddly (GEV's came out above its operating
-        cash flow), so the runway is based on operating cash flow instead.
-        Market cap and beta come along too, as fallbacks when Finnhub has none.
+        Debt and cash are from the latest quarterly balance sheet; operating cash flow is
+        trailing twelve months. Yahoo's 'freeCashflow' is deliberately ignored: it's computed
+        oddly (GEV's came out above its operating cash flow), so the analyzer's runway uses
+        operating cash flow instead.
+
+        Market cap and beta are included as fallbacks for when Finnhub has none.
         """
         ticker = yf.Ticker(symbol)
         info = ticker.info or {}
         shares_short, prior = info.get("sharesShort"), info.get("sharesShortPriorMonth")
         short_pct = info.get("shortPercentOfFloat")
         institutional = info.get("heldPercentInstitutions")
+        market_cap = info.get("marketCap")
 
         def millions(key):
             value = info.get(key)
             return value / 1e6 if value is not None else None
-        market_cap = info.get("marketCap")
 
         forward_eps = None
         try:
             estimates = ticker.earnings_estimate
             avg = estimates["avg"] if estimates is not None and "avg" in estimates else {}
-            fiscal_year_end = info.get("nextFiscalYearEnd")  # end of the year Yahoo calls "0y"
+            fiscal_year_end = info.get("nextFiscalYearEnd")  # end of the year Yahoo labels "0y"
             forward_eps = self.blend_ntm_eps(
-                avg.get("0y"), avg.get("+1y"),
+                avg.get("0y"),
+                avg.get("+1y"),
                 datetime.fromtimestamp(fiscal_year_end, MARKET_TZ).date() if fiscal_year_end else None,
-                datetime.now(MARKET_TZ).date())
+                datetime.now(MARKET_TZ).date(),
+            )
         except Exception as e:
             print(f"    [WARN] {symbol} analyst estimates unavailable, using Yahoo's forward P/E: {e}")
 
@@ -285,35 +304,36 @@ class FinnhubFetcher:
     @staticmethod
     def blend_ntm_eps(eps_this_year, eps_next_year, fiscal_year_end, today):
         """
-        Next-twelve-months EPS: the part of this fiscal year still ahead plus the matching slice
-        of next year. With 3 months left in the year, NTM = 25% of this year + 75% of next year.
+        Next-twelve-months EPS: whatever is left of this fiscal year plus the matching slice of
+        next year. With 3 months left in the year, NTM = 25% of this year + 75% of next.
 
-        Returns None when there's nothing usable, so the caller can fall back.
+        Falls back to whichever single estimate exists, or None if neither does.
         """
         this_year = None if eps_this_year is None or pd.isna(eps_this_year) else float(eps_this_year)
         next_year = None if eps_next_year is None or pd.isna(eps_next_year) else float(eps_next_year)
         if this_year is None or next_year is None or fiscal_year_end is None:
             return next_year if next_year is not None else this_year
+
         weight = min(max((fiscal_year_end - today).days / 365, 0.0), 1.0)
         return weight * this_year + (1 - weight) * next_year
 
     def get_options_interest(self, symbol: str, days_ahead: int = 30) -> dict:
         """
-        Total call and put open interest across option expirations in the next `days_ahead` days.
+        Total call and put open interest for expirations in the next `days_ahead` days.
 
-        Open interest = contracts still open (not yet closed or exercised). Near-dated contracts
-        are where traders position for short-term moves, and longer-dated ones would mostly add
-        noise from big hedges, so only the next month is counted. Yahoo updates open interest
-        once a day, after the previous session settles.
+        Only near-dated contracts are counted: that's where short-term positioning shows up,
+        while longer-dated ones are dominated by large hedges. Yahoo refreshes open interest once
+        a day, after the prior session settles.
 
-        Calls expiring by this Friday are also counted on their own ('call_oi_week'), so the report
-        can say how much of the call positioning runs out this week. "By Friday" also catches a
-        Thursday expiration in a holiday week and any Monday-Thursday dailies.
+        Calls expiring by this Friday are also tallied separately ('call_oi_week') so the report
+        can say how much call positioning rolls off this week. Using "on or before Friday" also
+        catches Thursday expirations in holiday weeks and Monday-Thursday dailies.
         """
         ticker = yf.Ticker(symbol)
         today = datetime.now(MARKET_TZ).date()
         cutoff = today + timedelta(days=days_ahead)
-        week_end = today + timedelta(days=(4 - today.weekday()) % 7)  # this Friday (next Friday on a weekend)
+        # This Friday, or next Friday when run on a weekend.
+        week_end = today + timedelta(days=(4 - today.weekday()) % 7)
         expirations = [d for d in ticker.options if datetime.strptime(d, "%Y-%m-%d").date() <= cutoff]
         if not expirations:
             return {}
@@ -326,6 +346,7 @@ class FinnhubFetcher:
             put_oi += int(chain.puts["openInterest"].fillna(0).sum())
             if datetime.strptime(expiry, "%Y-%m-%d").date() <= week_end:
                 call_oi_week += calls
+
         return {
             "call_oi": call_oi,
             "put_oi": put_oi,
@@ -336,31 +357,27 @@ class FinnhubFetcher:
             "week_end": week_end.isoformat(),
         }
 
-    def get_company_profile(self, symbol: str) -> dict:
-        """Company name and industry, so the report says "NVIDIA Corp · Semiconductors" instead of just "NVDA"."""
-        data = self._get("/stock/profile2", {"symbol": symbol})
-        return {
-            "name": data.get("name"),
-            "industry": data.get("finnhubIndustry"),
-            "market_cap_m": data.get("marketCapitalization"),
-        }
-
+    # ------------------------------------------------------------------ #
+    # Market-wide data
+    # ------------------------------------------------------------------ #
     def get_upcoming_earnings(self, symbols: list, days_ahead: int = 14) -> dict:
         """
-        Finds earnings dates for the watchlist in the next `days_ahead` days.
+        Earnings dates for `symbols` within the next `days_ahead` days.
 
-        Design choice: ONE call for the whole market's calendar, then we filter to our tickers,
-        instead of one call per ticker. That keeps us far under the 60 calls/minute limit as
-        the watchlist grows.
+        Pulls the whole market calendar in one call and filters locally, rather than one call
+        per ticker, so the 60 calls/minute limit doesn't tighten as the watchlist grows.
 
-        Returns {symbol: {"date": "2026-10-08", "hour": "amc", "eps_estimate": 1.23}}
-          'hour' is Finnhub's code: "bmo" = before market open, "amc" = after market close.
+        Returns {symbol: {"date": "2026-10-08", "hour": "amc", "eps_estimate": 1.23}}, where
+        'hour' is Finnhub's code: "bmo" = before market open, "amc" = after market close.
         """
         today = datetime.now(MARKET_TZ).date()
-        data = self._get("/calendar/earnings", {
-            "from": today.strftime("%Y-%m-%d"),
-            "to": (today + timedelta(days=days_ahead)).strftime("%Y-%m-%d"),
-        })
+        data = self._get(
+            "/calendar/earnings",
+            {
+                "from": today.strftime("%Y-%m-%d"),
+                "to": (today + timedelta(days=days_ahead)).strftime("%Y-%m-%d"),
+            },
+        )
 
         wanted = {s.upper() for s in symbols}
         upcoming = {}
@@ -376,11 +393,10 @@ class FinnhubFetcher:
 
     def get_market_movers(self, count: int = 5) -> dict:
         """
-        The biggest US gainers, losers and most-traded stocks from Yahoo's built-in screeners.
+        Biggest US gainers, losers and most-traded stocks from Yahoo's predefined screens.
 
-        Why: your watchlist only shows what you already follow. This section surfaces big moves
-        elsewhere in the market. Yahoo's screeners use the last *regular* session, so at 8 AM
-        they describe yesterday, which is how the report labels them.
+        These surface big moves outside the watchlist. The screens reflect the last *regular*
+        session, so on an 8 AM run they describe yesterday, and the report labels them that way.
         """
         movers = {}
         for key in ("day_gainers", "day_losers", "most_actives"):
@@ -391,12 +407,15 @@ class FinnhubFetcher:
                 print(f"[WARN] Market movers screen '{key}' failed: {e}")
                 quotes = []
 
-            movers[key] = [{
-                "symbol": q.get("symbol"),
-                "name": q.get("shortName") or q.get("longName"),
-                "price": q.get("regularMarketPrice"),
-                "change_pct": q.get("regularMarketChangePercent"),
-                "volume": q.get("regularMarketVolume"),
-                "avg_volume": q.get("averageDailyVolume3Month"),
-            } for q in quotes[:count]]
+            movers[key] = [
+                {
+                    "symbol": q.get("symbol"),
+                    "name": q.get("shortName") or q.get("longName"),
+                    "price": q.get("regularMarketPrice"),
+                    "change_pct": q.get("regularMarketChangePercent"),
+                    "volume": q.get("regularMarketVolume"),
+                    "avg_volume": q.get("averageDailyVolume3Month"),
+                }
+                for q in quotes[:count]
+            ]
         return movers
