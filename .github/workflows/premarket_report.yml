@@ -87,9 +87,22 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-sentiment.txt
 
+      # requirements-sentiment.txt adds CPU-only PyTorch and transformers for FinBERT news
+      # sentiment. It's only installed here, so the Tests workflow stays fast.
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt -r requirements-sentiment.txt
+
+      # The FinBERT model (~440 MB) is downloaded once and then restored from this cache each
+      # morning. Change the key if the model in config.yaml changes.
+      - name: Cache the FinBERT model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: huggingface-${{ runner.os }}-ProsusAI-finbert-v1
 
       # Backup cron runs start ~6:45 AM Central; hold until 7:00 so the data is fresh and the email
       # arrives on time. If the run started after 7:00, this doesn't wait at all.
@@ -115,8 +128,14 @@ jobs:
           mkdir -p history
           if git ls-remote --exit-code --heads origin history > /dev/null; then
             git fetch -q --depth=1 origin history
-            git show FETCH_HEAD:alerts.jsonl > history/alerts.jsonl
-            echo "Fetched $(wc -l < history/alerts.jsonl) logged alerts"
+            for NAME in alerts sentiment; do
+              if git show "FETCH_HEAD:${NAME}.jsonl" > "history/${NAME}.jsonl" 2> /dev/null; then
+                echo "Fetched $(wc -l < "history/${NAME}.jsonl") ${NAME} row(s)"
+              else
+                rm -f "history/${NAME}.jsonl"
+                echo "No ${NAME}.jsonl on the history branch yet"
+              fi
+            done
           else
             echo "No history branch yet (first run): the scorecard will say there's nothing to score"
           fi
@@ -130,6 +149,8 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           RECIPIENT_EMAILS: ${{ secrets.RECIPIENT_EMAILS }}
           DRY_RUN: ${{ inputs.dry_run }}
+          HF_HUB_DISABLE_TELEMETRY: "1"
+          TRANSFORMERS_VERBOSITY: error
         run: |
           if [ "$DRY_RUN" = "true" ]; then
             python main.py --dry-run
@@ -175,9 +196,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          PENDING="$PWD/output/alerts_pending.jsonl"
-          if [ ! -s "$PENDING" ]; then
-            echo "No new alerts to log today"
+          # alerts.jsonl: today's header alerts. sentiment.jsonl: every stock's FinBERT news score.
+          PENDING="$PWD/output"
+          NEW=""
+          for NAME in alerts sentiment; do
+            if [ -s "$PENDING/${NAME}_pending.jsonl" ]; then NEW="$NEW $NAME"; fi
+          done
+          if [ -z "$NEW" ]; then
+            echo "Nothing new to log today"
             exit 0
           fi
           URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
@@ -187,12 +213,16 @@ jobs:
           else
             git init -q -b history "$DIR"  # first run: start the branch
           fi
-          cat "$PENDING" >> "$DIR/alerts.jsonl"
+          for NAME in $NEW; do
+            cat "$PENDING/${NAME}_pending.jsonl" >> "$DIR/${NAME}.jsonl"
+            echo "Logged $(wc -l < "$PENDING/${NAME}_pending.jsonl") ${NAME} row(s)"
+          done
           cd "$DIR"
-          git add alerts.jsonl
-          git -c user.name="github-actions[bot]"               -c user.email="41898282+github-actions[bot]@users.noreply.github.com"               commit -q -m "Alerts for $(TZ=America/Chicago date +%F)"
+          git add -- *.jsonl
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "Alerts for $(TZ=America/Chicago date +%F)"
           git push -q "$URL" HEAD:history
-          echo "Logged $(wc -l < "$PENDING") alert(s); history now has $(wc -l < alerts.jsonl)"
 
       # Keeps each day's HTML/PDF for 14 days under the run's "Artifacts" section
       - uses: actions/upload-artifact@v5

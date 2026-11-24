@@ -27,12 +27,24 @@ from src.dispatcher import EmailDispatcher, parse_recipients
 from src.explainer import explain_moves
 from src.fetcher import MARKET_TZ, REGULAR_CLOSE, FinnhubFetcher, merge_news
 from src.formatter import ReportFormatter, fmt_pct
-from src.scorecard import alert_rows, build_scorecard, load_history, summary_line, write_pending
+from src.scorecard import (
+    alert_rows,
+    build_scorecard,
+    load_history,
+    sentiment_rows,
+    summary_line,
+    tone_history,
+    write_pending,
+)
 from src.sectors import CANDIDATE_FUNDS, MARKET_PROXY, assign_sectors, sector_context
+from src.sentiment import compare_inputs, load_classifier, news_mood, score_news
 
 OUTPUT_DIR = "output"
 HISTORY_FILE = os.path.join("history", "alerts.jsonl")  # fetched from the history branch by the workflow
 PENDING_FILE = os.path.join(OUTPUT_DIR, "alerts_pending.jsonl")  # today's rows, appended after a send
+# Every stock's daily FinBERT news score, for tone shifts and the sentiment hit rates.
+SENTIMENT_HISTORY_FILE = os.path.join("history", "sentiment.jsonl")
+SENTIMENT_PENDING_FILE = os.path.join(OUTPUT_DIR, "sentiment_pending.jsonl")
 MARKET_SYMBOLS = ["SPY", "QQQ"]  # benchmarks that also get a pre-market gap
 VIX_SYMBOL = "^VIX"  # daily close only; it doesn't trade pre-market
 TNX_SYMBOL = "^TNX"  # 10-year Treasury yield; daily close only, like the VIX
@@ -142,14 +154,15 @@ def fetch_symbol(
     return data
 
 
-def sector_moves(fetcher, analyzer, pipeline_data, results, sector_cfg, now) -> dict:
+def sector_moves(fetcher, analyzer, pipeline_data, results, sector_cfg, now) -> tuple:
     """
-    Groups the watchlist by sector fund (src/sectors.py) and returns each stock's fund move and
-    same-fund peers, for the "why it's moving" line. {} if the fund prices can't be fetched.
+    Groups the watchlist by sector fund (src/sectors.py). Returns (groups, context): each
+    stock's group, and its fund move and same-fund peers for the "why it's moving" line.
+    ({}, {}) if the fund prices can't be fetched.
     """
     funds = fetcher.get_daily_closes(CANDIDATE_FUNDS + [MARKET_PROXY])
     if funds.empty:
-        return {}
+        return {}, {}
     funds = FinnhubFetcher.drop_unfinished_bar(funds, now)
     stock_closes = {
         symbol: data["candles"]["close"]
@@ -183,7 +196,7 @@ def sector_moves(fetcher, analyzer, pipeline_data, results, sector_cfg, now) -> 
         for s, r in results.items()
         if "metrics" in r
     }
-    return sector_context(groups, analyzer.analyze_market(fund_raw), stock_moves)
+    return groups, sector_context(groups, analyzer.analyze_market(fund_raw), stock_moves)
 
 
 def main():
@@ -215,7 +228,8 @@ def main():
         )
 
     fetcher = FinnhubFetcher(api_key=api_key)
-    analyzer = QuantitativeAnalyzer(thresholds)
+    sentiment_cfg = config.get("sentiment", {})
+    analyzer = QuantitativeAnalyzer(thresholds, sentiment_cfg)
     now = datetime.now(MARKET_TZ)
 
     # ~500 calendar days is ~340 sessions: enough for the 200-day average to span the whole
@@ -231,6 +245,23 @@ def main():
             days_back=500,
             options_days=thresholds.get("options_window_days", 30),
         )
+
+    # News sentiment: every ticker's merged articles go through FinBERT in one batched pass. If the
+    # model isn't installed or fails, articles stay unscored and the analyzer counts keywords.
+    if sentiment_cfg.get("enabled", True):
+        print("--> Scoring news sentiment (FinBERT)")
+        classifier = safe_call("FinBERT", lambda: load_classifier(sentiment_cfg), None)
+        if classifier is not None:
+            safe_call("FinBERT scoring", lambda: score_news(pipeline_data, sentiment_cfg, classifier), False)
+            if sentiment_cfg.get("compare_inputs"):
+                # One-off check for choosing `input`: headline only vs. headline + summary.
+                lines = safe_call("FinBERT comparison", lambda: compare_inputs(pipeline_data, classifier), [])
+                os.makedirs(OUTPUT_DIR, exist_ok=True)
+                with open(os.path.join(OUTPUT_DIR, "sentiment_comparison.txt"), "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + "\n")
+                print("    Headline-only vs. headline+summary (also in output/sentiment_comparison.txt):")
+                for line in lines:
+                    print(f"      {line}")
 
     # A year-plus of benchmark history, so the scorecard can score every logged report day.
     print("--> Fetching market backdrop (SPY, QQQ, VIX)")
@@ -285,9 +316,17 @@ def main():
             print("    Skipping today's email. Use --force to send anyway.")
             return
 
+    # The workflow fetches both history files from the history branch before this runs; on the
+    # first run (or a local run) there aren't any, and the scorecard says so.
+    scorecard_cfg = config.get("scorecard", {})
+    history_path = scorecard_cfg.get("history_file", HISTORY_FILE)
+    history, history_status = safe_call("alert history", lambda: load_history(history_path), ([], "error"))
+    sentiment_path = scorecard_cfg.get("sentiment_history_file", SENTIMENT_HISTORY_FILE)
+    tone_rows, _ = safe_call("sentiment history", lambda: load_history(sentiment_path), ([], "error"))
+
     print("\n[*] Running quantitative analysis...")
     market = analyzer.analyze_market(market_raw)
-    results = analyzer.analyze(pipeline_data, market, earnings)
+    results = analyzer.analyze(pipeline_data, market, earnings, tone_history(tone_rows, now.date()))
     ranked = analyzer.rank_stocks(results, report_cfg.get("header_min_severity", 1.0))
 
     print(f"  └─ {len(ranked)} of {len(results)} stocks need attention:")
@@ -301,28 +340,27 @@ def main():
         if "error" in result:
             print(f"     [{symbol}] skipped: {result['error']}")
 
-    # Yesterday's scorecard. The workflow fetches the history file before this runs; on the first
-    # run (or a local run) there isn't one, and the section says so.
-    history_path = config.get("scorecard", {}).get("history_file", HISTORY_FILE)
-    history, history_status = safe_call("alert history", lambda: load_history(history_path), ([], "error"))
     scoring_candles = {symbol: data.get("candles") for symbol, data in pipeline_data.items()}
     scoring_candles.update({symbol: market_raw[symbol]["candles"] for symbol in MARKET_SYMBOLS})
     scorecard = safe_call(
         "scorecard",
-        lambda: build_scorecard(history, history_status, scoring_candles, now.date()),
+        lambda: build_scorecard(history, history_status, scoring_candles, now.date(), tone_rows),
         {"status": "unavailable"},
     )
     print(f"\n[*] Scorecard: {summary_line(scorecard)}")
 
+    print("\n--> Grouping the watchlist by sector")
+    groups, sectors = safe_call(
+        "sector grouping",
+        lambda: sector_moves(fetcher, analyzer, pipeline_data, results, config.get("sectors", {}), now),
+        ({}, {}),
+    )
+    # News tone across the watchlist and within each sector group (FinBERT runs only).
+    mood = safe_call("news mood", lambda: news_mood(results, groups, sentiment_cfg), None)
+
     explanations = {}
     explainer_cfg = config.get("explainer", {})
     if ranked and explainer_cfg.get("enabled", True):
-        print("\n--> Grouping the watchlist by sector")
-        sectors = safe_call(
-            "sector grouping",
-            lambda: sector_moves(fetcher, analyzer, pipeline_data, results, config.get("sectors", {}), now),
-            {},
-        )
         print("\n[*] Asking Claude why the flagged stocks are moving...")
         explanations = safe_call(
             "'why it's moving' lines",
@@ -349,6 +387,7 @@ def main():
         earnings=earnings,
         explanations=explanations,
         scorecard=scorecard,
+        news_mood=mood,
     )
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     stem = os.path.join(OUTPUT_DIR, f"premarket_{now:%Y-%m-%d}")
@@ -403,8 +442,10 @@ def main():
             alert_rows(ranked, results, market, now.date(), benchmark), history, PENDING_FILE
         )
         print(f"[✓] {logged} header alert(s) queued for the history log: {PENDING_FILE}")
+        logged = write_pending(sentiment_rows(results, now.date()), tone_rows, SENTIMENT_PENDING_FILE)
+        print(f"[✓] {logged} stock sentiment score(s) queued for the history log: {SENTIMENT_PENDING_FILE}")
     except Exception as e:
-        print(f"[WARN] Couldn't queue today's alerts for the history log: {e}")
+        print(f"[WARN] Couldn't queue today's rows for the history log: {e}")
 
     print("\n[✓] Pipeline execution finished.")
 

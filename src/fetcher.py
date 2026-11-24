@@ -489,6 +489,8 @@ class FinnhubFetcher:
             "operating_cashflow_m": millions("operatingCashflow"),
             "market_cap_m": market_cap / 1e6 if market_cap else None,
             "beta": info.get("beta"),
+            # Fallback company name for matching news to the stock when Finnhub's profile is missing.
+            "yahoo_name": info.get("longName") or info.get("shortName"),
             # Yahoo's classification, used to pick a sector fund when price history can't (sectors.py).
             "yahoo_sector": info.get("sector"),
             "yahoo_industry": info.get("industry"),

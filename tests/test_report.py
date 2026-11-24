@@ -401,6 +401,96 @@ class JumpLinkTests(unittest.TestCase):
         self.assertEqual(anchor_id("^VIX"), "stock--VIX")
 
 
+class SentimentDisplayTests(unittest.TestCase):
+    """FinBERT tone markers and labels in the email, text version and PDF (fake classifier)."""
+
+    def scored_report(self):
+        from src.sentiment import score_news
+
+        def fake(texts, **kwargs):  # "plunge" negative, "beats" positive, the rest neutral
+            out = []
+            for t in texts:
+                p, n = (0.9, 0.05) if "beats" in t else (0.05, 0.9) if "plunge" in t else (0.1, 0.1)
+                out.append([{"label": "positive", "score": p}, {"label": "negative", "score": n},
+                            {"label": "neutral", "score": 1 - p - n}])  # fmt: skip
+            return out
+
+        pipeline = sample_pipeline()
+        pipeline["AAA"]["news"].append(
+            {
+                "headline": "Chip stocks plunge across the board",
+                "summary": "",
+                "source": "Wire",
+                "datetime": 1,
+            }
+        )
+        self.assertTrue(score_news(pipeline, {"input": "headline"}, fake))
+        return build_report(pipeline)
+
+    def test_markers_and_labels_in_email_and_text(self):
+        formatter, ctx, _ = self.scored_report()
+        aaa = next(s for s in ctx["stocks"] if s["symbol"] == "AAA")
+        self.assertEqual(aaa["sentiment_detail"]["method"], "finbert")
+        html, text = formatter.render_html(ctx), formatter.render_text(ctx)
+        self.assertIn("title='negative'>–</b>", html)  # sign + colour, not colour alone
+        self.assertIn("title='neutral'>·</b>", html)
+        self.assertIn("[–] AAA shares plunge after guidance miss", text)
+        self.assertNotIn("keyword count", html)
+        # Only the two articles naming AAA count: one strongly negative, one neutral -> Bearish.
+        self.assertIn("sentiment Bearish (0 positive, 1 negative, 1 neutral)", html)
+
+    def test_unrelated_headlines_are_marked_not_counted(self):
+        formatter, ctx, _ = self.scored_report()
+        aaa = next(s for s in ctx["stocks"] if s["symbol"] == "AAA")
+        # The sector roundup is AAA's third headline, and it doesn't name AAA.
+        self.assertEqual((aaa["sentiment_detail"]["relevant"], aaa["sentiment_detail"]["total"]), (2, 3))
+        self.assertIn("[–] Chip stocks plunge across the board (not counted)", formatter.render_text(ctx))
+        self.assertRegex(
+            formatter.render_html(ctx),
+            r"Chip stocks plunge across the board<span[^>]*> — Wire · [^<]* not counted",
+        )
+
+    def test_mood_news_checks_and_strongest_story(self):
+        formatter, ctx, pipeline = self.scored_report()
+        aaa = next(s for s in ctx["stocks"] if s["symbol"] == "AAA")
+        aaa["metrics"]["news_divergence"] = "News vs. price: down 4.6% pre-market despite bullish coverage"
+        ctx["news_mood"] = {
+            "watchlist": {"name": "Watchlist", "label": "Bearish", "score": -0.31, "stories": 9, "positive": 1,
+                          "negative": 5},
+            "groups": [{"name": "Semiconductor", "fund": "SMH", "label": "Bearish", "score": -0.5, "stories": 4}],
+        }  # fmt: skip
+        html, text = formatter.render_html(ctx), formatter.render_text(ctx)
+        mood = "watchlist Bearish (score -0.31; 5 of 9 stories negative, 1 positive) · Semiconductor (SMH) Bearish"
+        self.assertIn(mood, text)
+        self.assertIn("News tone (FinBERT):</span> " + mood, html)
+        self.assertIn("News check: News vs. price: down 4.6% pre-market despite bullish coverage", text)
+        self.assertIn("News check", html)
+        self.assertIn("(strongest story)", text)  # AAA's plunge headline is its clearest story
+        with tempfile.TemporaryDirectory() as tmp:
+            texts, _ = render_pdf(formatter, ctx, pipeline, tmp)
+        self.assertIn("News tone (FinBERT):", " ".join(texts[0].split()))
+        self.assertIn("strongest story", " ".join(" ".join(texts).split()))
+
+    def test_keyword_fallback_is_labelled(self):
+        formatter, ctx, _ = build_report()  # unscored articles: keyword method
+        self.assertIn("keyword count, FinBERT unavailable", formatter.render_html(ctx))
+
+    def test_pdf_markers_and_finbert_credit(self):
+        from src.pdf_report import NewsletterPDF
+
+        formatter, ctx, pipeline = self.scored_report()
+        with tempfile.TemporaryDirectory() as tmp:
+            texts, _ = render_pdf(formatter, ctx, pipeline, tmp)
+            NewsletterPDF(formatter).build(ctx, pipeline, os.path.join(tmp, "r.pdf"))
+        self.assertIn("News sentiment", texts[-1])
+        self.assertIn("FinBERT", texts[-1])
+        self.assertIn("news sentiment by FinBERT (ProsusAI/finbert)", formatter.render_html(ctx))
+        aaa_page = next(t for t in texts if "Alpha Semiconductor" in t and "Key metrics" in t)
+        page = " ".join(aaa_page.split())
+        self.assertIn("sentiment Bearish (0 positive, 1 negative, 1 neutral)", page)
+        self.assertIn("Wire · not counted", page)
+
+
 class ScorecardRenderTests(unittest.TestCase):
     def test_no_history_message_everywhere(self):
         formatter, ctx, pipeline = build_report()

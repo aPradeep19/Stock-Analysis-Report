@@ -19,6 +19,8 @@ import pandas as pd
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
 
+from src.sentiment import divergence, shift, stock_sentiment, window_sentiment
+
 UP, DOWN, CAUTION = "up", "down", "caution"
 SESSION_WORDS = {"pre-market": "pre-market", "regular": "so far today", "after-hours": "after hours"}
 
@@ -163,8 +165,9 @@ class QuantitativeAnalyzer:
     _BULL_RE = re.compile(r"\b(" + "|".join(map(re.escape, BULLISH_WORDS)) + r")\b")
     _BEAR_RE = re.compile(r"\b(" + "|".join(map(re.escape, BEARISH_WORDS)) + r")\b")
 
-    def __init__(self, thresholds: dict):
+    def __init__(self, thresholds: dict, sentiment_config: dict = None):
         self.thresholds = thresholds
+        self.sentiment_config = sentiment_config or {}
 
         self.price_pct_limit = self.thresholds.get("price_change_pct", 5.0)
         self.gap_pct_limit = self.thresholds.get("premarket_gap_pct", 3.0)
@@ -230,14 +233,31 @@ class QuantitativeAnalyzer:
 
         return df
 
-    def _analyze_sentiment(self, news: list) -> dict:
+    def _analyze_sentiment(self, news: list, symbol=None, name=None, candles=None) -> dict:
         """
-        Classifies each article as positive, negative or neutral by counting bullish vs. bearish
-        words in its headline and summary. The overall label needs a margin of two articles, so
-        one ambiguous headline can't flip a stock to Bullish or Bearish on its own.
+        The stock's news sentiment: FinBERT's relevance-filtered, freshness-weighted score
+        (src/sentiment.py) when its articles were scored this run, otherwise the keyword count
+        below. Either way the dict has score, label, positive, negative, neutral, plus 'method'.
+        """
+        finbert = stock_sentiment(news, symbol, name, candles, self.sentiment_config)
+        return finbert if finbert is not None else self._keyword_sentiment(news)
+
+    def _keyword_sentiment(self, news: list) -> dict:
+        """
+        Fallback when FinBERT isn't available: classifies each article as positive, negative or
+        neutral by counting bullish vs. bearish words in its headline and summary. The overall
+        label needs a margin of two articles, so one ambiguous headline can't flip a stock to
+        Bullish or Bearish on its own.
         """
         if not news:
-            return {"score": 0, "label": "Neutral", "positive": 0, "negative": 0, "neutral": 0}
+            return {
+                "score": 0,
+                "label": "Neutral",
+                "positive": 0,
+                "negative": 0,
+                "neutral": 0,
+                "method": "keywords",
+            }
 
         positive = negative = neutral = 0
         for article in news:
@@ -264,6 +284,7 @@ class QuantitativeAnalyzer:
             "positive": positive,
             "negative": negative,
             "neutral": neutral,
+            "method": "keywords",
         }
 
     # ------------------------------------------------------------------ #
@@ -303,7 +324,9 @@ class QuantitativeAnalyzer:
     # ------------------------------------------------------------------ #
     # Watchlist
     # ------------------------------------------------------------------ #
-    def analyze(self, pipeline_data: dict, market: dict = None, earnings: dict = None) -> dict:
+    def analyze(
+        self, pipeline_data: dict, market: dict = None, earnings: dict = None, sentiment_history: dict = None
+    ) -> dict:
         """
         Runs every rule over the watchlist.
 
@@ -314,15 +337,21 @@ class QuantitativeAnalyzer:
         """
         market = market or {}
         earnings = earnings or {}
+        # {symbol: [earlier daily FinBERT scores, oldest first]} from the history branch.
+        sentiment_history = sentiment_history or {}
         # QQQ is the closest benchmark for a tech-heavy watchlist; SPY is the fallback.
         benchmark = market.get("QQQ") or market.get("SPY") or {}
 
         return {
-            symbol: self._analyze_symbol(data, benchmark, earnings.get(symbol))
+            symbol: self._analyze_symbol(
+                symbol, data, benchmark, earnings.get(symbol), sentiment_history.get(symbol, [])
+            )
             for symbol, data in pipeline_data.items()
         }
 
-    def _analyze_symbol(self, data: dict, benchmark: dict, earnings_event: dict | None) -> dict:
+    def _analyze_symbol(
+        self, symbol: str, data: dict, benchmark: dict, earnings_event: dict | None, tone_history=()
+    ) -> dict:
         quote = data.get("quote", {}) or {}
         raw_candles = data.get("candles", pd.DataFrame())
         news = data.get("news", []) or []
@@ -414,7 +443,9 @@ class QuantitativeAnalyzer:
         self._balance_sheet_signals(metrics, triggers, alerts)
         self._earnings_signals(earnings_event, metrics, alerts)
 
-        sentiment = self._analyze_sentiment(news)
+        name = fundamentals.get("name") or fundamentals.get("yahoo_name")
+        sentiment = self._analyze_sentiment(news, symbol, name, raw_candles)
+        self._news_signals(sentiment, alerts, metrics, tone_history, triggers, news, raw_candles)
         alerts.sort(key=lambda a: a["severity"], reverse=True)
 
         return {
@@ -427,7 +458,32 @@ class QuantitativeAnalyzer:
             "sentiment": sentiment["label"],
             "sentiment_detail": sentiment,
             "top_news": news[:3],
+            "all_news": news,  # every scored article, for the sector / watchlist news mood
         }
+
+    def _news_signals(self, sentiment, alerts, metrics, tone_history, triggers, news=(), candles=None):
+        """
+        FinBERT-derived signals for the stock's page (sentiment raises no alerts yet):
+          - news vs. price: the biggest flagged move set against the news from its own window
+          - tone shift: today's news score vs. its own average over recent report days
+        """
+        moves = [a for a in alerts if a.get("kind") == "move"]
+        if moves:
+            biggest = max(moves, key=lambda a: a["severity"])
+            if biggest.get("window") == "overnight":
+                session = metrics.get("premarket_session") or "pre-market"
+                pct, words, window = metrics.get("gap_pct"), SESSION_WORDS.get(session, session), "overnight"
+            else:
+                pct, words, window = metrics.get("last_session_pct"), "last session", "last session"
+            in_window = window_sentiment(news, candles, window, self.sentiment_config)
+            line = divergence(pct, words, in_window, self.sentiment_config)
+            if line:
+                triggers.add("news_divergence", line)
+                metrics["news_divergence"] = line
+        line = shift(sentiment, list(tone_history), self.sentiment_config)
+        if line:
+            triggers.add("news_shift", line)
+            metrics["news_shift"] = line
 
     # ------------------------------------------------------------------ #
     # Price moves

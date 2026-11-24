@@ -49,6 +49,7 @@ from src.formatter import (
     INK_2,
     LINK,
     MUTED,
+    SENTIMENT_NOTE,
     UP_TEXT,
     WATCHLIST_ANCHOR,
     anchor_id,
@@ -57,8 +58,13 @@ from src.formatter import (
     fmt_num,
     fmt_pct,
     fmt_ratio,
+    is_strongest,
+    mood_line,
     safe_url,
+    sentiment_summary,
     session_labels,
+    strongest_note,
+    tone_mark,
 )
 
 TONE_PDF = {
@@ -403,6 +409,7 @@ class NewsletterPDF:
             for label, text in (
                 ("Today (Central)", self.formatter.releases_line(ctx)),
                 ("Earnings this week", self.formatter.earnings_week_line(ctx)),
+                ("News tone (FinBERT)", mood_line(ctx.get("news_mood"))),
             )
             if text
         ]
@@ -574,6 +581,8 @@ class NewsletterPDF:
             return [[heading, summary]]
 
         footnote = Paragraph(escape(scorecard_text.footnote(card)), s["small"])
+        hits_line = scorecard_text.sentiment_hits_line(card)
+        sentiment_hits = [Spacer(1, 4), Paragraph(escape(hits_line), s["cell"])] if hits_line else []
         earnings = [
             Paragraph(escape(scorecard_text.earnings_line(item)), s["cell"]) for item in card["earnings"]
         ]
@@ -595,7 +604,9 @@ class NewsletterPDF:
                 ]
                 if row_count < len(rows):
                     parts.append(Paragraph(f"…and {len(rows) - row_count} more", s["small"]))
-            parts += earnings + (hit_rates if with_hit_rates else []) + [Spacer(1, 4), footnote]
+            parts += (
+                earnings + (hit_rates if with_hit_rates else []) + sentiment_hits + [Spacer(1, 4), footnote]
+            )
             return parts
 
         versions = [version(n, True) for n in range(len(rows), min(len(rows), 3) - 1, -1)]
@@ -839,25 +850,42 @@ class NewsletterPDF:
         news = stock.get("top_news", [])[: ctx["news_per_stock"]]
         if not news:
             return []
-        sd = stock.get("sentiment_detail", {})
+        summary = sentiment_summary(stock.get("sentiment_detail"), stock["sentiment"])
         story = [
             Paragraph(
-                f"Headlines <font name='Helvetica' size='8.5' color='{INK_2}'>· sentiment {escape(stock['sentiment'])} "
-                f"({sd.get('positive', 0)} positive, {sd.get('negative', 0)} negative, "
-                f"{sd.get('neutral', 0)} neutral)</font>",
+                f"Headlines <font name='Helvetica' size='8.5' color='{INK_2}'>· sentiment {escape(summary)}</font>",
                 s["h3"],
             )
         ]
-        style = ParagraphStyle("news", parent=s["bullet"], fontSize=9)
+        base = ParagraphStyle("news", parent=s["bullet"], fontSize=9)
+        extra = strongest_note(stock, news)
+        if extra:  # the clearest-toned relevant story isn't among the latest: show it too
+            news = news + [{**extra, "sentiment": {"label": extra["label"], "counted": True}}]
         for article in news:
             url = safe_url(article.get("url"))
-            source = escape(article.get("source") or "")
-            suffix = f" <font size='7.5' color='{MUTED}'>— {source}</font>" if source else ""
+            mark = tone_mark(article)
+            # The tone sign replaces the plain bullet, in its colour, so it costs no width.
+            bullet, style = "•", base
+            if mark:
+                bullet = mark[0]
+                style = ParagraphStyle(
+                    f"news_{article['sentiment']['label']}",
+                    parent=base,
+                    bulletColor=colors.HexColor(mark[1]),
+                    bulletFontName="Helvetica-Bold",
+                )
+            meta = [escape(article.get("source") or "")]
+            if mark and not mark[2]:
+                meta.append("not counted")
+            if is_strongest(article, stock):
+                meta.append("strongest story")
+            meta = " · ".join(m for m in meta if m)
+            suffix = f" <font size='7.5' color='{MUTED}'>— {meta}</font>" if meta else ""
 
-            def make(text, url=url, suffix=suffix):
+            def make(text, url=url, suffix=suffix, style=style, bullet=bullet):
                 headline = escape(text)
                 link = f"<link href='{url}' color='{INK}'><u>{headline}</u></link>" if url else headline
-                return Paragraph(link + suffix, style, bulletText="•")
+                return Paragraph(link + suffix, style, bulletText=bullet)
 
             story.append(
                 _fit_lines(make, article.get("headline") or "Untitled", CONTENT_W, HEADLINE_MAX_LINES)
@@ -882,6 +910,8 @@ class NewsletterPDF:
         story = [
             Paragraph("How alerts work", s["h2"]),
             Paragraph(escape(how_alerts_work), s["body"]),
+            Paragraph("News sentiment", s["h3"]),
+            Paragraph(escape(SENTIMENT_NOTE), s["small"]),
             Paragraph("Reading short interest, options and cash runway", s["h2"]),
             Paragraph(escape(self.formatter.positioning_note()), s["body"]),
         ]

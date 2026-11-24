@@ -64,6 +64,36 @@ explainer:
   summary_chars: 300             # each article summary is trimmed to this length
   timeout_seconds: 90
 
+# News sentiment, scored by FinBERT (ProsusAI/finbert, a free financial-news model that runs on the
+# GitHub runner's CPU; install with requirements-sentiment.txt). Without it, the report falls back
+# to counting bullish/bearish keywords and says so. Sentiment doesn't raise alerts yet.
+sentiment:
+  enabled: true
+  model: ProsusAI/finbert
+  input: headline+summary        # "headline", or "headline+summary" (headline + first sentences)
+  summary_sentences: 2
+  skip_summaries_starting_with:  # teaser "summaries" about other stories; headline used alone
+    - "Today's big story"
+  batch_size: 16
+  compare_inputs: false          # true: log headline-only vs. headline+summary scores on a dry run
+  # A stock's score: P(positive) - P(negative) per article, averaged over articles that name the
+  # stock (ticker, company name or an alias below), weighted by how fresh they are.
+  weights:
+    since last close: 1.0
+    during last session: 0.6
+    older: 0.3
+    unknown: 0.5
+  label_threshold: 0.25          # Bullish at +0.25 or above, Bearish at -0.25 or below
+  confident_probability: 0.70    # Mixed: a >=70% positive and a >=70% negative article, net score near 0
+  min_relevant_articles: 2       # fewer relevant articles than this is always Neutral
+  strongest_min_net: 0.5         # "strongest story": only if its P(pos) - P(neg) is at least this far from 0
+  shift_window_days: 5           # tone shift: compare today with the average of up to this many report days
+  shift_min_days: 3              # ...needing at least this many logged days
+  shift_min_change: 0.4          # ...and a change in score at least this big
+  aliases:                       # names news uses that differ from the company's legal name
+    GOOGL: [Google]
+    GOOG: [Google]
+
 # Sector groups for the "why it's moving" line ("fell with chip stocks"). Each stock is matched
 # automatically to the sector fund its daily returns move with (market move removed); when that
 # match is weak or a near-tie, Yahoo's sector/industry label decides instead. New tickers need
@@ -73,7 +103,7 @@ sectors:
   min_match_lead: 0.03           # ...as do near-ties between the top two funds
   min_history_days: 60           # shared trading days needed for a price match (newer listings
                                  #   use the label); kept low so young theme funds like NCLD count
-  overrides: {}                  # e.g. {GEV: XLU} to force a group
+  overrides: {}                  # e.g. {AAA: BBB} to force a group
 
 # Today's US economic releases, shown in the market backdrop. Finnhub's economic calendar isn't
 # on the free plan, so this list is kept by hand. Times are Central, 24-hour. Only entries
@@ -81,6 +111,3 @@ sectors:
 #   - {date: 2026-12-10, time: "07:30", event: "CPI (Nov)"}
 #   - {date: 2026-12-10, time: "13:00", event: "FOMC decision"}
 economic_calendar: []
-
-# Secrets are NOT stored here. Set them as environment variables (locally) or GitHub Secrets:
-#   FINNHUB_API_KEY, SENDER_EMAIL, EMAIL_PASSWORD (Gmail App Password), RECIPIENT_EMAILS

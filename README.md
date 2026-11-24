@@ -30,6 +30,16 @@ You'll need four environment variables (or GitHub secrets), plus one optional on
 
 For local runs, make a `.env` and fill it in; `main.py` reads it on start-up. `.env` is gitignored, and real environment variables (including GitHub secrets) take priority over it.
 
+### News sentiment (optional)
+
+Headline sentiment is scored by [FinBERT](https://huggingface.co/ProsusAI/finbert), a free financial-news model that runs on the CPU and needs no API key. The GitHub workflow installs it automatically. To use it locally:
+
+```bash
+pip install -r requirements-sentiment.txt
+```
+
+That installs the CPU-only build of PyTorch plus `transformers`; the first run downloads the model (about 440 MB) to `~/.cache/huggingface`. Without these packages everything still works: the report falls back to counting bullish and bearish keywords and says so next to each stock's sentiment. Settings (model, weights, thresholds, name aliases) are in the `sentiment:` block of `config.yaml`.
+
 ## Running it
 
 ```bash

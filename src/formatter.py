@@ -63,6 +63,73 @@ def anchor_id(symbol):
     return "stock-" + re.sub(r"[^A-Za-z0-9]+", "-", symbol or "")
 
 
+# News tone markers, one per headline. The sign carries the meaning and colour only reinforces it;
+# all three characters exist in the PDF's built-in Helvetica (a true minus sign doesn't).
+TONE_MARKS = {"positive": ("+", UP_TEXT), "negative": ("\u2013", DOWN_TEXT), "neutral": ("\u00b7", INK_2)}
+
+SENTIMENT_NOTE = (
+    "FinBERT (ProsusAI/finbert), a financial-news model, marks each headline + positive, \u2013 negative "
+    "or \u00b7 neutral. A stock's label averages the stories that name it (at least two), weighting news "
+    "since the last close most: Bullish or Bearish when it leans clearly one way, Mixed when strong "
+    "stories offset, otherwise Neutral. Without FinBERT it counts bullish and bearish keywords instead."
+)
+
+
+def tone_mark(article):
+    """(sign, colour, counted) for a FinBERT-scored article, or None if it wasn't scored."""
+    sentiment = article.get("sentiment")
+    if not sentiment or sentiment.get("label") not in TONE_MARKS:
+        return None
+    sign, color = TONE_MARKS[sentiment["label"]]
+    return sign, color, sentiment.get("counted", True)
+
+
+def sentiment_summary(detail, label):
+    """'Bullish (3 positive, 1 negative, 2 neutral)', noting when it came from the keyword fallback."""
+    detail = detail or {}
+    counts = (
+        f"{detail.get('positive', 0)} positive, {detail.get('negative', 0)} negative, "
+        f"{detail.get('neutral', 0)} neutral"
+    )
+    if detail.get("method") == "keywords":
+        return f"{label} ({counts}; keyword count, FinBERT unavailable)"
+    return f"{label} ({counts})"
+
+
+def strongest_note(stock, shown):
+    """
+    The stock's clearest-toned relevant story (from FinBERT) when it isn't already among the
+    headlines shown, else None. A shown one is marked "strongest" in place instead.
+    """
+    best = (stock.get("sentiment_detail") or {}).get("strongest")
+    if not best or any(a.get("headline") == best.get("headline") for a in shown):
+        return None
+    return best
+
+
+def is_strongest(article, stock):
+    best = (stock.get("sentiment_detail") or {}).get("strongest")
+    return bool(best) and article.get("headline") == best.get("headline")
+
+
+def news_checks(stock):
+    """FinBERT-derived notes for the stock: news vs. price, and a shift in news tone."""
+    m = stock.get("metrics", {})
+    return [line for line in (m.get("news_divergence"), m.get("news_shift")) if line]
+
+
+def mood_line(mood):
+    """'Watchlist Bearish (score -0.21; 18 of 47 stories negative) · Semiconductor Bearish ...' or ''."""
+    if not mood or not mood.get("watchlist"):
+        return ""
+    w = mood["watchlist"]
+    parts = [
+        f"watchlist {w['label']} (score {w['score']:+.2f}; {w['negative']} of {w['stories']} stories negative, {w['positive']} positive)"
+    ]
+    parts += [f"{g['name']} ({g['fund']}) {g['label']}" for g in mood.get("groups", [])]
+    return " · ".join(parts)
+
+
 def html_ticker_link(symbol):
     """The ticker as a link to its section further down the email. Some mail apps (notably Gmail)
     drop in-email jump links; there it simply reads as the ticker."""
@@ -259,6 +326,7 @@ class ReportFormatter:
         earnings: dict = None,
         explanations: dict = None,
         scorecard: dict = None,
+        news_mood: dict = None,
     ) -> dict:
         """
         Everything the renderers need. Stocks whose analysis failed are split into 'errors' so
@@ -316,6 +384,7 @@ class ReportFormatter:
             "economic_events": todays_releases(economic_calendar, generated_at.date()),
             "earnings_week": earnings_this_week(earnings, generated_at.date()),
             "scorecard": scorecard or {"status": "none"},
+            "news_mood": news_mood,
             "thresholds": self.thresholds,
             "news_per_stock": self.news_per_stock,
         }
@@ -458,6 +527,7 @@ class ReportFormatter:
             for label, text in (
                 ("Today (Central)", self.releases_line(ctx)),
                 ("Earnings this week", self.earnings_week_line(ctx)),
+                ("News tone (FinBERT)", mood_line(ctx.get("news_mood"))),
             )
             if text
         ]
@@ -474,6 +544,17 @@ class ReportFormatter:
             for label, text in lines
         )
         return self._card(self._h2("Market backdrop") + table + notes)
+
+    def _html_news_checks(self, stock):
+        lines = news_checks(stock)
+        if not lines:
+            return ""
+        items = "".join(f"<li style='margin:3px 0;'>{e(line)}</li>" for line in lines)
+        return (
+            f"<div style='font-size:13px;font-weight:600;margin:14px 0 4px;'>News check "
+            f"<span style='font-weight:400;color:{INK_2};'>· FinBERT</span></div>"
+            f"<ul style='margin:0;padding-left:18px;font-size:13px;line-height:1.45;'>{items}</ul>"
+        )
 
     def _html_why(self, item, label="Why:"):
         """The 'why it's moving' text in body ink and size (it's for reading, not a footnote)."""
@@ -713,14 +794,27 @@ class ReportFormatter:
 
         sd = stock.get("sentiment_detail", {})
         news_items = []
-        for article in stock.get("top_news", [])[: ctx["news_per_stock"]]:
+        shown = stock.get("top_news", [])[: ctx["news_per_stock"]]
+        extra = strongest_note(stock, shown)
+        if extra:  # the clearest-toned relevant story isn't among the latest: show it too
+            shown = shown + [{**extra, "sentiment": {"label": extra["label"], "counted": True}}]
+        for article in shown:
             url = safe_url(article.get("url"))
             headline = e(article.get("headline") or "Untitled")
             link = f"<a href='{url}' style='color:{INK};'>{headline}</a>" if url else headline
+            mark = tone_mark(article)
+            if mark:
+                sign, color, _ = mark
+                tone = article["sentiment"]["label"]
+                link = f"<b style='color:{color};' title='{tone}'>{sign}</b>&nbsp; {link}"
             meta_bits = [article.get("source")]
             if article.get("datetime"):
                 ts = datetime.fromtimestamp(article["datetime"], MARKET_TZ)
                 meta_bits.append(f"{ts:%b} {ts.day}")
+            if mark and not mark[2]:
+                meta_bits.append("not counted")
+            if is_strongest(article, stock):
+                meta_bits.append("strongest story")
             meta = " · ".join(b for b in meta_bits if b)
             meta_html = f"<span style='color:{MUTED};font-size:12px;'> — {e(meta)}</span>" if meta else ""
             news_items.append(f"<li style='margin:4px 0;'>{link}{meta_html}</li>")
@@ -728,8 +822,8 @@ class ReportFormatter:
         if news_items:
             news_html = (
                 f"<div style='font-size:13px;font-weight:600;margin:14px 0 4px;'>Headlines "
-                f"<span style='font-weight:400;color:{INK_2};'>· sentiment {e(stock['sentiment'])} "
-                f"({sd.get('positive', 0)} positive, {sd.get('negative', 0)} negative, {sd.get('neutral', 0)} neutral)</span></div>"
+                f"<span style='font-weight:400;color:{INK_2};'>· sentiment "
+                f"{e(sentiment_summary(sd, stock['sentiment']))}</span></div>"
                 f"<ul style='margin:0;padding-left:18px;font-size:13px;line-height:1.45;'>{''.join(news_items)}</ul>"
             )
 
@@ -739,7 +833,7 @@ class ReportFormatter:
             f"<div style='font-size:20px;font-weight:600;'>{e(stock['symbol'])}</div>{name_line}</div>"
             f"{self._html_why(stock, label=WHATS_MOVING_LABEL)}"
             f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0' style='margin-top:12px;border-collapse:collapse;'>{metric_rows}</table>"
-            f"{alerts_html}{news_html}"
+            f"{alerts_html}{self._html_news_checks(stock)}{news_html}"
             f"<div style='font-size:12px;margin-top:12px;'><a href='#{WATCHLIST_ANCHOR}' "
             f"style='color:{LINK};text-decoration:none;'>Back to watchlist</a></div>"
         )
@@ -880,7 +974,8 @@ class ReportFormatter:
         return (
             f"<tr><td style='padding:4px 8px 24px;font-size:12px;line-height:1.5;color:{INK_2};'>"
             f"{pdf_note}{e(rules)}<br><br>Data: Finnhub (quotes, news, fundamentals, earnings) and Yahoo Finance "
-            f"(price history, pre-market trades, forward P/E, short interest, options, institutional ownership, debt and cash). "
+            f"(price history, pre-market trades, forward P/E, short interest, options, institutional ownership, debt and cash); "
+            f"news sentiment by FinBERT (ProsusAI/finbert). "
             f"Automated analysis for information only, not investment advice."
             f"</td></tr>"
         )
@@ -960,6 +1055,9 @@ class ReportFormatter:
                     f"<div style='font-size:13px;font-weight:600;margin-top:14px;'>Hit rates over "
                     f"{card['days_logged']} report days</div>" + self._html_table(*self.hit_rate_table(card))
                 )
+            hits = scorecard_text.sentiment_hits_line(card)
+            if hits:
+                inner += f"<div style='font-size:13px;margin-top:10px;'>{e(hits)}</div>"
             inner += f"<div style='font-size:12px;color:{INK_2};margin-top:10px;'>{e(scorecard_text.footnote(card))}</div>"
         return self._card(inner)
 
@@ -979,6 +1077,9 @@ class ReportFormatter:
                 widths = [18, 8, 7, 20, 14]
                 lines.append("    " + "".join(f"{h:<{w}}" for h, w in zip(header, widths)))
                 lines += ["    " + "".join(f"{c:<{w}}" for c, w in zip(row, widths)) for row in rows]
+            hits = scorecard_text.sentiment_hits_line(card)
+            if hits:
+                lines.append(f"  {hits}")
             lines.append(f"  {scorecard_text.footnote(card)}")
         return lines + [""]
 
@@ -1013,6 +1114,8 @@ class ReportFormatter:
             lines.append(f"TODAY (CENTRAL): {self.releases_line(ctx)}")
         if self.earnings_week_line(ctx):
             lines.append(f"EARNINGS THIS WEEK: {self.earnings_week_line(ctx)}")
+        if mood_line(ctx.get("news_mood")):
+            lines.append(f"NEWS TONE (FINBERT): {mood_line(ctx.get('news_mood'))}")
         if len(lines) > 2:
             lines.append("")
 
@@ -1050,9 +1153,18 @@ class ReportFormatter:
             lines += self._text_why(stock, "  ")
             lines += [f"  {k}: {v}" for k, v in self._metric_rows(stock)]
             lines += [f"  ! {a['text']}" for a in stock["alerts"]]
-            for article in stock.get("top_news", [])[: ctx["news_per_stock"]]:
+            lines += [f"  News check: {line}" for line in news_checks(stock)]
+            shown = stock.get("top_news", [])[: ctx["news_per_stock"]]
+            extra = strongest_note(stock, shown)
+            if extra:
+                shown = shown + [{**extra, "sentiment": {"label": extra["label"], "counted": True}}]
+            for article in shown:
                 url = article.get("url") if safe_url(article.get("url")) else ""
-                lines.append(f"  * {article.get('headline')} {url}".rstrip())
+                mark = tone_mark(article)
+                tag = f"[{mark[0]}] " if mark else ""
+                note = " (not counted)" if mark and not mark[2] else ""
+                note += " (strongest story)" if is_strongest(article, stock) else ""
+                lines.append(f"  * {tag}{article.get('headline')}{note} {url}".rstrip())
             lines.append("")
 
         lines.append("READING SHORT INTEREST, OPTIONS AND CASH RUNWAY")

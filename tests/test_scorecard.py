@@ -218,6 +218,10 @@ class HistoryFileTests(unittest.TestCase):
             self.assertIn(field, first)
         self.assertEqual(first["date"], "2026-10-01")
         self.assertEqual(first["benchmark_price"], 398.0)
+        # Each stock's news sentiment is kept for later checks (keyword method here: no FinBERT).
+        self.assertEqual(first["sentiment_method"], "keywords")
+        self.assertIn(first["sentiment_label"], ("Bullish", "Bearish", "Neutral", "Mixed"))
+        self.assertIn("sentiment_score", first)
         earnings = [r for r in rows if r["kind"] == "event"]
         self.assertTrue(all(r.get("earnings_date") for r in earnings))
 

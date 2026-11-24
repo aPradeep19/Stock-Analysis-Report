@@ -1,0 +1,8 @@
+# Optional: FinBERT news sentiment (src/sentiment.py). Only premarket_report.yml installs these,
+# so the Tests workflow stays fast; without them the report falls back to keyword sentiment.
+#
+# CPU-only PyTorch. The "+cpu" build exists only on PyTorch's own index, so pinning it stops pip
+# from picking PyPI's default Linux build, which pulls GPU libraries the runner can't use.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.1+cpu
+transformers

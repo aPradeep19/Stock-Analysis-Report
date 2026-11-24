@@ -49,7 +49,9 @@ def alert_rows(ranked, results, market, day, benchmark):
     bench = market.get(benchmark) or {}
     rows = []
     for item in ranked:
-        metrics = (results.get(item["symbol"]) or {}).get("metrics", {})
+        result = results.get(item["symbol"]) or {}
+        metrics = result.get("metrics", {})
+        sentiment = result.get("sentiment_detail") or {}
         for alert in item["alerts"]:
             row = {
                 "date": day.isoformat(),
@@ -67,6 +69,10 @@ def alert_rows(ranked, results, market, day, benchmark):
                 "benchmark_last_close": bench.get("last_close"),
                 "benchmark_price": bench.get("premarket_price"),
                 "benchmark_gap_pct": bench.get("gap_pct"),
+                # Recorded so we can check later whether news sentiment predicted anything.
+                "sentiment_score": sentiment.get("score"),
+                "sentiment_label": sentiment.get("label"),
+                "sentiment_method": sentiment.get("method"),
             }
             if alert.get("kind") == "event" and metrics.get("earnings_date"):
                 row["earnings_date"] = metrics["earnings_date"]
@@ -141,7 +147,7 @@ def write_pending(rows, history, path):
 # ---------------------------------------------------------------------- #
 # Scoring
 # ---------------------------------------------------------------------- #
-def build_scorecard(history, status, candles, today):
+def build_scorecard(history, status, candles, today, sentiment_history=None):
     """
     Everything the renderers need, as a plain dict:
       status       "ok", "none" (nothing logged before today) or "unavailable" (history error)
@@ -152,6 +158,8 @@ def build_scorecard(history, status, candles, today):
       benchmark    benchmark symbol and display name
       earnings     realized move vs. typical for earnings that reported in the latest session
       hit_rates    per alert kind, once HIT_RATE_MIN_DAYS distinct report dates are logged
+      sentiment_hits  how often Bullish / Bearish news labels were followed by a move their
+                   way, once HIT_RATE_MIN_DAYS days of daily sentiment are logged
     `candles` is {symbol: daily DataFrame}, including the benchmark(s).
     """
     if status == "error":
@@ -185,7 +193,89 @@ def build_scorecard(history, status, candles, today):
         "earnings": earnings_reactions(past, candles, benchmark),
         "hit_rates": hit_rates(past, candles) if days_logged >= HIT_RATE_MIN_DAYS else None,
         "days_logged": days_logged,
+        **sentiment_scorecard(sentiment_history or [], candles, today_iso),
     }
+
+
+# ---------------------------------------------------------------------- #
+# News sentiment: one row per stock per real send, kept in a second history file
+# ---------------------------------------------------------------------- #
+def sentiment_rows(results, day):
+    """Today's FinBERT news score for every stock (not just flagged ones), ready to log."""
+    rows = []
+    for symbol, result in results.items():
+        sentiment = result.get("sentiment_detail") or {}
+        if sentiment.get("method") != "finbert":
+            continue  # keyword-fallback days aren't comparable, so they aren't logged
+        metrics = result.get("metrics", {})
+        row = {
+            "date": day.isoformat(),
+            "symbol": symbol,
+            "score": sentiment.get("score"),
+            "label": sentiment.get("label"),
+            "relevant": sentiment.get("relevant"),
+            "session": metrics.get("premarket_session") or "pre-market",
+            "last_close": metrics.get("last_close"),
+            "price": metrics.get("premarket_price"),
+        }
+        rows.append({k: _plain(v) for k, v in row.items()})
+    return rows
+
+
+def tone_history(rows, today):
+    """{symbol: [daily scores before today, oldest first]} for the analyzer's tone-shift check."""
+    by_symbol = {}
+    for row in sorted(rows, key=lambda r: r["date"]):
+        if row["date"] < today.isoformat() and row.get("score") is not None:
+            by_symbol.setdefault(row["symbol"], []).append(row["score"])
+    return by_symbol
+
+
+def sentiment_scorecard(rows, candles, today_iso):
+    """
+    Whether the news labels predicted anything: for each logged Bullish or Bearish label, did the
+    session that followed close above (Bullish) or below (Bearish) the price at report time?
+    Shown once HIT_RATE_MIN_DAYS report days of sentiment are logged.
+    """
+    past = [row for row in rows if str(row.get("date")) < today_iso]
+    days = len({row["date"] for row in past})
+    if days < HIT_RATE_MIN_DAYS:
+        return {"sentiment_hits": None, "sentiment_days": days}
+    by_label = {}
+    for row in past:
+        sign = {"Bullish": 1, "Bearish": -1}.get(row.get("label"))
+        start = row.get("price") or row.get("last_close")
+        if not sign or not start:
+            continue
+        found = _session_bar(candles.get(row["symbol"]), row["date"], row.get("session"))
+        if found is None:
+            continue
+        move = sign * (float(found[0]["close"]) / start - 1) * 100
+        by_label.setdefault(row["label"], []).append(move)
+    hits = [
+        {
+            "label": label,
+            "scored": len(moves),
+            "hit_pct": sum(1 for m in moves if m > 0) / len(moves) * 100,
+            "avg_move": sum(moves) / len(moves),
+        }
+        for label, moves in sorted(by_label.items())
+    ]
+    return {"sentiment_hits": hits or None, "sentiment_days": days}
+
+
+def sentiment_hits_line(card):
+    """'Bullish news: followed by a gain 58% of the time (n=40, avg +0.4%)...' or None."""
+    hits = (card or {}).get("sentiment_hits")
+    if not hits:
+        return None
+    words = {"Bullish": "a gain", "Bearish": "a loss"}
+    parts = [
+        f"{h['label']} news was followed by {words.get(h['label'], 'a move that way')} "
+        f"{h['hit_pct']:.0f}% of the time (n={h['scored']}, avg {h['avg_move']:+.1f}% its way)"
+        for h in hits
+    ]
+    return f"News sentiment over {card['sentiment_days']} report days: " + "; ".join(parts) + "."
 
 
 def _session_bar(df, logged_date, session):
