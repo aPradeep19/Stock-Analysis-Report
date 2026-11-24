@@ -7,3 +7,4 @@ matplotlib
 reportlab
 pypdf
 pypdfium2
+anthropic

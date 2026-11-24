@@ -24,12 +24,15 @@ import yaml
 
 from src.analyzer import QuantitativeAnalyzer
 from src.dispatcher import EmailDispatcher, parse_recipients
-from src.fetcher import MARKET_TZ, FinnhubFetcher
+from src.explainer import explain_moves
+from src.fetcher import MARKET_TZ, REGULAR_CLOSE, FinnhubFetcher, merge_news
 from src.formatter import ReportFormatter, fmt_pct
+from src.sectors import CANDIDATE_FUNDS, MARKET_PROXY, assign_sectors, sector_context
 
 OUTPUT_DIR = "output"
 MARKET_SYMBOLS = ["SPY", "QQQ"]  # benchmarks that also get a pre-market gap
 VIX_SYMBOL = "^VIX"  # daily close only; it doesn't trade pre-market
+TNX_SYMBOL = "^TNX"  # 10-year Treasury yield; daily close only, like the VIX
 
 
 def load_config(filepath: str = "config.yaml") -> dict:
@@ -39,6 +42,31 @@ def load_config(filepath: str = "config.yaml") -> dict:
 
     with open(filepath, "r", encoding="utf-8") as file:
         return yaml.safe_load(file)
+
+
+def load_env_file(path: str = ".env") -> list:
+    """
+    Loads KEY=VALUE lines from a local .env file (gitignored) into the environment, for local runs.
+
+    Variables already set in the real environment win, so GitHub Actions secrets are never
+    overridden. Blank values are skipped, so an unfilled template behaves like no file at all.
+    Returns the names it loaded (never the values).
+    """
+    if not os.path.exists(path):
+        return []
+    loaded = []
+    with open(path, encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.removeprefix("export ").strip()
+            value = value.strip().strip("'\"")
+            if key and value and not os.environ.get(key):
+                os.environ[key] = value
+                loaded.append(key)
+    return loaded
 
 
 def parse_args():
@@ -79,12 +107,27 @@ def fetch_symbol(
     }
     yahoo = safe_call(f"{symbol} Yahoo fundamentals", lambda: fetcher.get_yahoo_fundamentals(symbol), {})
     options = safe_call(f"{symbol} options", lambda: fetcher.get_options_interest(symbol, options_days), {})
-    profile, metrics = {}, {}
+    profile, metrics, finnhub_news = {}, {}, []
     if use_finnhub:
         data["quote"] = safe_call(f"{symbol} quote", lambda: fetcher.get_quote(symbol), {})
-        data["news"] = safe_call(f"{symbol} news", lambda: fetcher.get_recent_news(symbol, days_back=3), [])
+        finnhub_news = safe_call(f"{symbol} news", lambda: fetcher.get_recent_news(symbol, days_back=3), [])
         profile = safe_call(f"{symbol} profile", lambda: fetcher.get_company_profile(symbol), {})
         metrics = safe_call(f"{symbol} fundamentals", lambda: fetcher.get_key_metrics(symbol), {})
+
+    # Finnhub often hasn't picked up overnight press releases by 8 AM, so Yahoo's feed is merged in.
+    # The merged list drives the Headlines section, sentiment and the "why it's moving" line.
+    yahoo_news = safe_call(f"{symbol} Yahoo news", lambda: fetcher.get_yahoo_news(symbol), [])
+    data["news"] = merge_news(finnhub_news, yahoo_news, limit=10)
+
+    # Rating changes since the previous session's close: old enough to cover yesterday's move
+    # and the overnight gap, recent enough to matter.
+    candles = data["candles"]
+    data["ratings"] = []
+    if candles is not None and len(candles) >= 2:
+        since = datetime.combine(candles.index[-2].date(), REGULAR_CLOSE, MARKET_TZ)
+        data["ratings"] = safe_call(
+            f"{symbol} analyst ratings", lambda: fetcher.get_rating_changes(symbol, since), []
+        )
 
     # Later sources overwrite earlier ones, but only with non-None values: Finnhub wins where it
     # has data and Yahoo fills the gaps (e.g. a dry run with no key). Forward P/E, short interest
@@ -96,8 +139,55 @@ def fetch_symbol(
     return data
 
 
+def sector_moves(fetcher, analyzer, pipeline_data, results, sector_cfg, now) -> dict:
+    """
+    Groups the watchlist by sector fund (src/sectors.py) and returns each stock's fund move and
+    same-fund peers, for the "why it's moving" line. {} if the fund prices can't be fetched.
+    """
+    funds = fetcher.get_daily_closes(CANDIDATE_FUNDS + [MARKET_PROXY])
+    if funds.empty:
+        return {}
+    funds = FinnhubFetcher.drop_unfinished_bar(funds, now)
+    stock_closes = {
+        symbol: data["candles"]["close"]
+        for symbol, data in pipeline_data.items()
+        if data.get("candles") is not None and not data["candles"].empty
+    }
+    labels = {
+        symbol: (data["fundamentals"].get("yahoo_sector"), data["fundamentals"].get("yahoo_industry"))
+        for symbol, data in pipeline_data.items()
+    }
+    groups = assign_sectors(stock_closes, funds, labels, sector_cfg.get("overrides"), sector_cfg)
+    for symbol, group in groups.items():
+        score = f" ({group['score']:.2f})" if group["score"] is not None else ""
+        print(f"    {symbol}: {group['fund']} by {group['method']}{score}")
+
+    # Recent prices come through get_historical_candles, not the bulk download above, so they
+    # get the same repairs as the watchlist (e.g. today's bar rebuilt when Yahoo sends it blank).
+    fund_raw = {
+        fund: {
+            "candles": safe_call(
+                f"{fund} history", lambda f=fund: fetcher.get_historical_candles(f, 30), pd.DataFrame()
+            ),
+            "premarket": safe_call(
+                f"{fund} pre-market", lambda f=fund: fetcher.get_premarket_snapshot(f), {}
+            ),
+        }
+        for fund in sorted({g["fund"] for g in groups.values()})
+    }
+    stock_moves = {
+        s: {"gap_pct": r["metrics"].get("gap_pct"), "last_session_pct": r["metrics"].get("last_session_pct")}
+        for s, r in results.items()
+        if "metrics" in r
+    }
+    return sector_context(groups, analyzer.analyze_market(fund_raw), stock_moves)
+
+
 def main():
     args = parse_args()
+    loaded = load_env_file()
+    if loaded:
+        print(f"[i] Loaded from .env: {', '.join(loaded)}")
 
     config = load_config()
     watchlist = [s.upper() for s in config.get("watchlist", [])]
@@ -156,6 +246,12 @@ def main():
         ),
         "premarket": {},
     }
+    market_raw[TNX_SYMBOL] = {
+        "candles": safe_call(
+            "10-yr yield history", lambda: fetcher.get_historical_candles(TNX_SYMBOL, 30), pd.DataFrame()
+        ),
+        "premarket": {},
+    }
 
     earnings = {}
     if api_key:
@@ -201,9 +297,41 @@ def main():
         if "error" in result:
             print(f"     [{symbol}] skipped: {result['error']}")
 
+    explanations = {}
+    explainer_cfg = config.get("explainer", {})
+    if ranked and explainer_cfg.get("enabled", True):
+        print("\n--> Grouping the watchlist by sector")
+        sectors = safe_call(
+            "sector grouping",
+            lambda: sector_moves(fetcher, analyzer, pipeline_data, results, config.get("sectors", {}), now),
+            {},
+        )
+        print("\n[*] Asking Claude why the flagged stocks are moving...")
+        explanations = safe_call(
+            "'why it's moving' lines",
+            lambda: explain_moves(
+                ranked,
+                pipeline_data,
+                explainer_cfg,
+                sector_context=sectors,
+                cache_dir=OUTPUT_DIR,
+                quiet=args.dry_run,
+            ),
+            {},
+        )
+
     # Everything is written to output/ as well, so every run leaves a preview behind.
     formatter = ReportFormatter(report_cfg, thresholds)
-    ctx = formatter.build_context(results, ranked, market, movers, now)
+    ctx = formatter.build_context(
+        results,
+        ranked,
+        market,
+        movers,
+        now,
+        economic_calendar=config.get("economic_calendar") or [],
+        earnings=earnings,
+        explanations=explanations,
+    )
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     stem = os.path.join(OUTPUT_DIR, f"premarket_{now:%Y-%m-%d}")
 

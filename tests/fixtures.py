@@ -137,15 +137,107 @@ def sample_pipeline():
     return pipeline
 
 
+LONG_HEADLINE = (
+    "{symbol} shares whipsaw as investors weigh blowout data-center guidance against a surprise CFO "
+    "departure, export-license uncertainty and a fresh round of analyst price-target changes, while "
+    "options traders pile into short-dated calls ahead of next week's investor day and index rebalance ({n})"
+)
+
+
+def stress_pipeline():
+    """
+    Worst-case PDF layout input: 11 tickers (a full real watchlist), most of them alerting on
+    several rules at once, three long headlines each, and long company and industry names.
+    """
+    gaps = [-6.5, 5.2, -4.1, 7.8, -3.6, 4.4, -9.0, 3.3, 0.4, -5.5, 6.1]
+    pipeline = {}
+    for i, gap in enumerate(gaps):
+        symbol = f"STR{chr(ord('A') + i)}"
+        calm = abs(gap) < 1  # one quiet ticker, so "most" rather than all of them alert
+        candles = make_candles(
+            50 + i * 20,
+            0.03,
+            seed=40 + i,
+            last_return=0.002 if calm else gap / 100 * 1.4,
+            last_volume_mult=1.0 if calm else 2.5 + i % 3,
+        )
+        pipeline[symbol] = {
+            "quote": {},
+            "candles": candles,
+            "news": [
+                {
+                    "headline": LONG_HEADLINE.format(symbol=symbol, n=n),
+                    "url": "https://example.com/news/long",
+                    "source": "Example Wire",
+                    "summary": "",
+                    "datetime": int(datetime(2026, 9, 30, 18 - n).timestamp()),
+                }
+                for n in range(3)
+            ],
+            "premarket": make_snapshot(candles, gap),
+            "fundamentals": {
+                "name": f"Extraordinarily Long Holdings Name International Incorporated {symbol} (synthetic)",
+                "industry": "Semiconductors & Semiconductor Equipment",
+                "market_cap_m": 50_000,
+                "forward_pe": 30.0,
+                "beta": 1.4,
+                "short_pct_float": 5.0 if calm else 22.0,
+                "short_ratio": 2.0 if calm else 11.0,
+                "short_change_pct": 12.0,
+                "call_oi": 400_000,
+                "put_oi": 300_000 if calm else 700_000,
+                "put_call_oi_ratio": 0.75 if calm else 1.75,
+                "options_window_days": 30,
+                "call_oi_week": 100_000 if calm else 300_000,
+                "call_oi_week_pct": 25.0 if calm else 75.0,
+                "week_end": "2026-10-16",
+                "institutional_pct": 70.0,
+                "total_debt_m": 4_000,
+                "total_cash_m": 300,
+                "operating_cashflow_m": 800.0 if calm else -900.0,
+            },
+        }
+    return pipeline
+
+
+def stress_earnings():
+    return {f"STR{c}": {"date": "2026-10-02", "hour": "amc", "eps_estimate": 0.5} for c in "ADGJ"}
+
+
 def sample_market():
     spy = make_candles(560, 0.009, seed=20)
     qqq = make_candles(480, 0.012, seed=21)
     vix = make_candles(17, 0.05, seed=22, drift=0.0)
+    tnx = make_candles(4.5, 0.01, seed=23, drift=0.0)  # quoted in percent, as Yahoo does now
     return {
         "SPY": {"candles": spy, "premarket": make_snapshot(spy, -0.3)},
         "QQQ": {"candles": qqq, "premarket": make_snapshot(qqq, -0.5)},
         "^VIX": {"candles": vix, "premarket": {}},
+        "^TNX": {"candles": tnx, "premarket": {}},
     }
+
+
+LONG_WHY = (
+    "Shares fell after the company cut its full-year revenue outlook, citing weaker data-center orders and a "
+    "delayed product ramp, and announced its chief financial officer will step down at the end of the quarter."
+)
+
+
+def stress_context(ranked, day="2026-10-01"):
+    """Every optional front-page and stock-page extra at once: a 'why' line per ranked stock,
+    a busy economic calendar and a long one (fed through build_context)."""
+    explanations = {
+        item["symbol"]: {"text": LONG_WHY, "source": "Example Wire", "url": "https://example.com/why"}
+        for item in ranked
+    }
+    calendar = [
+        {"date": day, "time": "07:30", "event": "CPI (Sep)"},
+        {"date": day, "time": "07:30", "event": "Retail sales (Sep)"},
+        {"date": day, "time": "09:00", "event": "Consumer sentiment (prelim)"},
+        {"date": day, "time": "13:00", "event": "FOMC decision"},
+        {"date": day, "time": "13:30", "event": "Fed chair press conference"},
+    ]
+    return explanations, calendar
 
 
 def sample_earnings():

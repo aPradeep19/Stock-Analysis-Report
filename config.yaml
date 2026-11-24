@@ -51,5 +51,36 @@ market_movers:
   enabled: true                  # "Outside your watchlist" section (Yahoo gainers/losers/most active)
   count: 5
 
+# "Why it's moving": up to two sentences per flagged stock, written by Claude from that stock's
+# fresh news, analyst rating changes and sector move, with every source credited. Needs
+# ANTHROPIC_API_KEY; without it the report goes out without these lines. Sonnet at medium
+# effort costs roughly 3-4 cents a run; claude-haiku-5-5 at low effort is well under a cent
+# but writes plainer lines.
+explainer:
+  enabled: true
+  model: claude-sonnet-5-5
+  effort: medium                 # low | medium | high
+  max_articles: 5                # headlines sent per stock
+  summary_chars: 300             # each article summary is trimmed to this length
+  timeout_seconds: 90
+
+# Sector groups for the "why it's moving" line ("fell with chip stocks"). Each stock is matched
+# automatically to the sector fund its daily returns move with (market move removed); when that
+# match is weak or a near-tie, Yahoo's sector/industry label decides instead. New tickers need
+# no setup. The run log prints each stock's group and how it was chosen.
+sectors:
+  min_match_score: 0.30          # weaker price matches fall back to Yahoo's label
+  min_match_lead: 0.03           # ...as do near-ties between the top two funds
+  min_history_days: 60           # shared trading days needed for a price match (newer listings
+                                 #   use the label); kept low so young theme funds like NCLD count
+  overrides: {}                  # e.g. {GEV: XLU} to force a group
+
+# Today's US economic releases, shown in the market backdrop. Finnhub's economic calendar isn't
+# on the free plan, so this list is kept by hand. Times are Central, 24-hour. Only entries
+# dated today appear in the report; past ones can be deleted any time.
+#   - {date: 2026-12-10, time: "07:30", event: "CPI (Nov)"}
+#   - {date: 2026-12-10, time: "13:00", event: "FOMC decision"}
+economic_calendar: []
+
 # Secrets are NOT stored here. Set them as environment variables (locally) or GitHub Secrets:
 #   FINNHUB_API_KEY, SENDER_EMAIL, EMAIL_PASSWORD (Gmail App Password), RECIPIENT_EMAILS

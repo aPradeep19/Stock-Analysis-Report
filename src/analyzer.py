@@ -88,6 +88,19 @@ def _num(value):
     return float(value)
 
 
+TNX_SYMBOL = "^TNX"  # 10-year Treasury yield index
+
+
+def _yield_pct(value):
+    """
+    ^TNX as a percent. Yahoo quotes it directly (4.92 = 4.92%) as of late 2026, but historically
+    quoted ten times that (49.2); no real 10-year yield is anywhere near 20%, so that's the cut.
+    """
+    if value is None:
+        return None
+    return value / 10 if value > 20 else value
+
+
 def level_of(value, bounds, levels):
     """The (name, meaning) a value falls in. Bounds [5, 10, 20] split values into <5, 5-10, 10-20, 20+."""
     return levels[bisect.bisect_right(bounds, value)]
@@ -115,6 +128,23 @@ def runway_text(months):
     if months < 1:
         return "under a month"
     return f"~{months:.0f} months" if months < 24 else f"~{months / 12:.1f} years"
+
+
+class _SignalLog(list):
+    """
+    The trigger lines, plus a parallel list naming what each line is about ('rsi', 'sma_50', ...).
+
+    Renderers that already show a figure elsewhere (the PDF's Key metrics table) use the kind to
+    skip lines that would repeat it, without matching on wording that may change.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.kinds = []
+
+    def add(self, kind, text):
+        self.append(text)
+        self.kinds.append(kind)
 
 
 class QuantitativeAnalyzer:
@@ -261,6 +291,13 @@ class QuantitativeAnalyzer:
                 "gap_pct": _pct(snapshot.get("price"), last_close),
                 "return_1m_pct": _pct(last_close, month_ago),
             }
+            if symbol == TNX_SYMBOL:
+                yield_now, yield_prev = _yield_pct(last_close), _yield_pct(prev_close)
+                summary[symbol]["yield_pct"] = yield_now
+                # Yields move in basis points (0.01%), and a % change of a yield means little.
+                summary[symbol]["last_session_bp"] = (
+                    (yield_now - yield_prev) * 100 if None not in (yield_now, yield_prev) else None
+                )
         return summary
 
     # ------------------------------------------------------------------ #
@@ -272,7 +309,8 @@ class QuantitativeAnalyzer:
 
         Returns {symbol: result}. A result is either {"error": reason} when the price history is
         unusable, or a dict with 'metrics', 'triggers', 'alerts' (most severe first), sentiment
-        and the top headlines.
+        and the top headlines. 'signals' repeats 'triggers' as {"text", "kind"} dicts for renderers
+        that filter by topic.
         """
         market = market or {}
         earnings = earnings or {}
@@ -357,7 +395,7 @@ class QuantitativeAnalyzer:
             **fundamentals,
         }
 
-        triggers = []  # descriptive lines, always shown on the stock's page
+        triggers = _SignalLog()  # descriptive lines, always shown on the stock's page
         alerts = []  # threshold breaches, eligible for the header
 
         # Order matters: alerts are sorted by severity below, and the sort is stable, so ties
@@ -383,7 +421,8 @@ class QuantitativeAnalyzer:
             "price": last_close,
             "change_pct": last_session_pct,
             "metrics": metrics,
-            "triggers": triggers,
+            "triggers": list(triggers),
+            "signals": [{"text": t, "kind": k} for t, k in zip(triggers, triggers.kinds, strict=True)],
             "alerts": alerts,
             "sentiment": sentiment["label"],
             "sentiment_detail": sentiment,
@@ -434,18 +473,20 @@ class QuantitativeAnalyzer:
 
     def _gap_signals(self, snapshot, premarket_price, gap_pct, gap_sigma, benchmark, triggers, alerts):
         if gap_pct is None:
-            triggers.append("No pre-market trades yet today")
+            triggers.add("premarket", "No pre-market trades yet today")
             return
 
         # The scheduled run sees pre-market trades, but manual runs later in the day see the
         # regular or after-hours session, so the wording follows whichever session it was.
         session = snapshot.get("session") or "pre-market"
         when = SESSION_WORDS.get(session, session)
-        triggers.append(f"Trading at ${premarket_price:.2f} {when}, {gap_pct:+.2f}% vs. last close")
+        triggers.add("premarket", f"Trading at ${premarket_price:.2f} {when}, {gap_pct:+.2f}% vs. last close")
 
         what = "Gapping" if session == "pre-market" else "Trading"
         alert = self._move_alert(gap_pct, gap_sigma, self.gap_pct_limit, what, when, benchmark.get("gap_pct"))
         if alert:
+            # Marks a move since the last close, which only news from after that close can explain.
+            alert["window"] = "overnight"
             alerts.append(alert)
 
     def _last_session_signals(self, last_session_pct, last_sigma, benchmark, triggers, alerts):
@@ -453,7 +494,7 @@ class QuantitativeAnalyzer:
             return
 
         direction = "Up" if last_session_pct > 0 else "Down"
-        triggers.append(f"Last session: {last_session_pct:+.2f}% ({direction})")
+        triggers.add("last_session", f"Last session: {last_session_pct:+.2f}% ({direction})")
         alert = self._move_alert(
             last_session_pct,
             last_sigma,
@@ -469,7 +510,7 @@ class QuantitativeAnalyzer:
         if volume_ratio is None:
             return
 
-        triggers.append(f"Volume: {volume_ratio:.1f}x the 20-day average")
+        triggers.add("volume", f"Volume: {volume_ratio:.1f}x the 20-day average")
         if volume_ratio >= self.vol_multiplier:
             move = f" on a {last_session_pct:+.1f}% day" if last_session_pct is not None else ""
             alerts.append(
@@ -490,7 +531,7 @@ class QuantitativeAnalyzer:
             return
 
         if rsi > self.rsi_overbought:
-            triggers.append(f"Potentially overbought (14 day RSI: {rsi:.1f})")
+            triggers.add("rsi", f"Potentially overbought (14 day RSI: {rsi:.1f})")
             alerts.append(
                 {
                     "text": f"RSI {rsi:.0f}: overbought, stretched after a run-up",
@@ -500,11 +541,11 @@ class QuantitativeAnalyzer:
                 }
             )
         elif rsi >= self.rsi_bullish:
-            triggers.append(f"Bullish momentum (14 day RSI: {rsi:.1f})")
+            triggers.add("rsi", f"Bullish momentum (14 day RSI: {rsi:.1f})")
         elif rsi >= self.rsi_oversold:
-            triggers.append(f"Bearish/weak momentum (14 day RSI: {rsi:.1f})")
+            triggers.add("rsi", f"Bearish/weak momentum (14 day RSI: {rsi:.1f})")
         else:
-            triggers.append(f"Potentially oversold (14 day RSI: {rsi:.1f})")
+            triggers.add("rsi", f"Potentially oversold (14 day RSI: {rsi:.1f})")
             alerts.append(
                 {
                     "text": f"RSI {rsi:.0f}: oversold, selling may be exhausted",
@@ -523,7 +564,7 @@ class QuantitativeAnalyzer:
                 continue
 
             side = "above" if last_close > level else "below"
-            triggers.append(f"Price {side} {n}-day average (${level:.2f})")
+            triggers.add(f"sma_{n}", f"Price {side} {n}-day average (${level:.2f})")
             if prior_level is None:
                 continue
 
@@ -646,7 +687,7 @@ class QuantitativeAnalyzer:
         forward_pe = metrics.get("forward_pe")
         if forward_pe is not None and forward_pe < 0:
             metrics["forward_pe"] = None
-            triggers.append("No forward P/E: analysts expect a loss over the next 12 months")
+            triggers.add("valuation", "No forward P/E: analysts expect a loss over the next 12 months")
 
     def _short_interest_signals(self, metrics, triggers, alerts):
         short_pct = metrics.get("short_pct_float")
@@ -666,8 +707,9 @@ class QuantitativeAnalyzer:
         detail = (f", {days:.1f} days to cover ({days_level.lower()})" if days is not None else "") + (
             f", {change:+.0f}% vs. prior report" if change is not None else ""
         )
-        triggers.append(
-            f"Short interest {short_pct:.1f}% of float ({short_level.lower()}){detail}. {short_meaning}"
+        triggers.add(
+            "short_interest",
+            f"Short interest {short_pct:.1f}% of float ({short_level.lower()}){detail}. {short_meaning}",
         )
 
         # Squeeze setup: a crowded short, or a large one that would take more than ~2 weeks of
@@ -721,7 +763,7 @@ class QuantitativeAnalyzer:
                     )
             elif ratio is not None:
                 text += f" (put/call {ratio:.2f}; too few contracts to read much into)"
-            triggers.append(text)
+            triggers.add("open_interest", text)
 
         # When most near-dated calls expire at once, traders close or roll them and dealers unwind
         # their hedges. That can pin the price near big strikes beforehand and free it up after.
@@ -732,7 +774,7 @@ class QuantitativeAnalyzer:
             monthly = " (monthly expiration)" if 15 <= friday.day <= 21 else ""
             when = f"{friday:%a %b} {friday.day}{monthly}"
             text = f"{_count(week_calls)} calls ({week_pct:.0f}% of near-term calls) expire by {when}"
-            triggers.append(text)
+            triggers.add("calls_expiring", text)
             if week_pct >= self.calls_expiring_pct and week_calls >= self.options_min_oi:
                 alerts.append(
                     {
@@ -749,7 +791,7 @@ class QuantitativeAnalyzer:
     def _ownership_signals(self, metrics, triggers):
         inst_pct = metrics.get("institutional_pct")
         if inst_pct is not None:
-            triggers.append(f"Institutions hold {inst_pct:.1f}% of shares")
+            triggers.add("ownership", f"Institutions hold {inst_pct:.1f}% of shares")
 
     def _balance_sheet_signals(self, metrics, triggers, alerts):
         # Gross debt alone says little; what matters is the cash held against it and whether the
@@ -761,16 +803,19 @@ class QuantitativeAnalyzer:
             net_debt = debt - cash
             metrics["net_debt_m"] = net_debt
             label = "Net debt" if net_debt > 0 else "Net cash"
-            triggers.append(f"{label} {_dollars(net_debt)} (debt {_dollars(debt)}, cash {_dollars(cash)})")
+            triggers.add(
+                "net_debt", f"{label} {_dollars(net_debt)} (debt {_dollars(debt)}, cash {_dollars(cash)})"
+            )
 
         if op_cash is not None and op_cash < 0 and cash is not None:
             months = cash / -op_cash * 12
             runway_level, runway_meaning = level_of(months, self.runway_levels, RUNWAY_LEVELS)
             metrics["cash_runway_months"] = months
             metrics["cash_runway_level"] = runway_level
-            triggers.append(
+            triggers.add(
+                "cash_runway",
                 f"Burning {_dollars(op_cash)} a year from operations: cash lasts {runway_text(months)} "
-                f"at that rate ({runway_level.lower()}), {runway_meaning}"
+                f"at that rate ({runway_level.lower()}), {runway_meaning}",
             )
             if runway_level == "Short":
                 alerts.append(

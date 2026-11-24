@@ -12,7 +12,7 @@ Turns analyzer output into the email: HTML body, plain-text twin and subject lin
 
 import html
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from src.analyzer import (
@@ -47,6 +47,8 @@ TONE = {
 
 # "Segoe UI" is deliberately unquoted: this string is dropped into style='...' attributes, where
 # a quote would close the attribute early. Unquoted multi-word font names are still valid CSS.
+WHATS_MOVING_LABEL = "What's moving it:"
+
 FONT = "-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif"
 
 # Wording for the "latest price" column depends on when the report runs. The scheduled 8 AM ET
@@ -79,6 +81,56 @@ SESSION_LABELS = {
 def session_labels(session):
     """Labels for a session, defaulting to pre-market for unknown or missing sessions."""
     return SESSION_LABELS.get(session or "pre-market", SESSION_LABELS["pre-market"])
+
+
+def todays_releases(entries, today):
+    """
+    Today's entries from config.yaml's economic_calendar, earliest first, as
+    [{"time": "7:30 AM", "event": "CPI (Nov)"}]. Times are entered and shown in Central.
+    Malformed entries are skipped rather than breaking the report.
+    """
+    releases = []
+    for entry in entries or []:
+        try:
+            if str(entry["date"]) != today.isoformat():
+                continue
+            clock = datetime.strptime(str(entry.get("time") or "00:00"), "%H:%M")
+            event = str(entry["event"]).strip()
+        except (KeyError, TypeError, ValueError):
+            print(f"    [WARN] Ignoring malformed economic_calendar entry: {entry!r}")
+            continue
+        if event:
+            label = f"{clock:%I:%M %p}".lstrip("0") if entry.get("time") else "Time TBA"
+            releases.append({"sort": clock.time(), "time": label, "event": event})
+    releases.sort(key=lambda r: r["sort"])
+    return [{"time": r["time"], "event": r["event"]} for r in releases]
+
+
+def earnings_this_week(earnings, today):
+    """
+    Watchlist earnings from today through this Friday (next Friday on a weekend), soonest first,
+    as [{"symbol", "date", "hour", "label": "NVDA Wed after close"}].
+    """
+    week_end = today + timedelta(days=(4 - today.weekday()) % 7)
+    hours = {"bmo": " before open", "amc": " after close"}
+    upcoming = []
+    for symbol, event in (earnings or {}).items():
+        try:
+            day = datetime.strptime(str(event["date"]), "%Y-%m-%d").date()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if today <= day <= week_end:
+            when = "today" if day == today else f"{day:%a}"
+            upcoming.append(
+                {
+                    "symbol": symbol,
+                    "date": day.isoformat(),
+                    "hour": event.get("hour"),
+                    "label": f"{symbol} {when}{hours.get(event.get('hour'), '')}",
+                }
+            )
+    upcoming.sort(key=lambda item: (item["date"], item["hour"] != "bmo", item["symbol"]))
+    return upcoming
 
 
 def _most_common_session(sessions):
@@ -122,6 +174,11 @@ def fmt_volume(value):
         if abs(value) >= size:
             return f"{value / size:.1f}{suffix}"
     return f"{value:.0f}"
+
+
+def fmt_bp(value):
+    """Signed basis points: 0.6 -> '+0.6 bp'."""
+    return "—" if value is None else f"{value:+.1f} bp"
 
 
 def fmt_market_cap(millions):
@@ -178,12 +235,21 @@ class ReportFormatter:
         market: dict = None,
         movers: dict = None,
         generated_at: datetime = None,
+        economic_calendar: list = None,
+        earnings: dict = None,
+        explanations: dict = None,
     ) -> dict:
         """
         Everything the renderers need. Stocks whose analysis failed are split into 'errors' so
         they still show up in the watchlist table instead of silently disappearing.
+
+        `economic_calendar` is config.yaml's hand-kept list of releases (times in Central),
+        `earnings` the fetched earnings calendar, and `explanations` the explainer's
+        {symbol: {"text", "source", "url"}}. Each is optional; missing ones just leave their
+        lines out.
         """
         generated_at = generated_at or datetime.now()
+        explanations = explanations or {}
 
         stocks = []
         errors = []
@@ -191,7 +257,9 @@ class ReportFormatter:
             if "error" in result:
                 errors.append({"symbol": symbol, "error": result["error"]})
                 continue
-            stocks.append({"symbol": symbol, **result})
+            stocks.append({"symbol": symbol, **result, "why": explanations.get(symbol)})
+        # Copies, so the analyzer's ranking stays untouched.
+        ranked = [{**item, "why": explanations.get(item["symbol"])} for item in ranked]
 
         # Biggest pre-market move first, stocks with no pre-market trade last, so reading order
         # roughly matches urgency.
@@ -224,9 +292,29 @@ class ReportFormatter:
             "stocks": stocks,
             "errors": errors,
             "movers": movers or {},
+            "economic_events": todays_releases(economic_calendar, generated_at.date()),
+            "earnings_week": earnings_this_week(earnings, generated_at.date()),
             "thresholds": self.thresholds,
             "news_per_stock": self.news_per_stock,
         }
+
+    # Market-context one-liners, shared by every renderer.
+    @staticmethod
+    def releases_line(ctx):
+        events = ctx.get("economic_events") or []
+        return " · ".join(f"{ev['time']} {ev['event']}" for ev in events)
+
+    @staticmethod
+    def earnings_week_line(ctx):
+        return " · ".join(item["label"] for item in ctx.get("earnings_week") or [])
+
+    @staticmethod
+    def why_parts(item):
+        """(sentence, source) for a stock's 'why it's moving' line, or None when there isn't one."""
+        why = item.get("why")
+        if not why or not why.get("text"):
+            return None
+        return why["text"], why.get("source")
 
     def subject(self, ctx: dict) -> str:
         ranked = ctx["ranked"]
@@ -305,13 +393,23 @@ class ReportFormatter:
 
     def _html_market(self, ctx):
         market = ctx["market"]
-        names = {"SPY": "S&P 500 (SPY)", "QQQ": "Nasdaq-100 (QQQ)", "^VIX": "VIX fear gauge"}
+        names = {
+            "SPY": "S&P 500 (SPY)",
+            "QQQ": "Nasdaq-100 (QQQ)",
+            "^VIX": "VIX fear gauge",
+            "^TNX": "10-yr Treasury",
+        }
         cells = []
-        for symbol in ("SPY", "QQQ", "^VIX"):
+        for symbol in names:
             data = market.get(symbol)
             if not data:
                 continue
-            if symbol == "^VIX":
+            if symbol == "^TNX":
+                main = fmt_pct(data.get("yield_pct"), signed=False, decimals=2)
+                sub = f"{fmt_bp(data.get('last_session_bp'))} last session"
+                # Neutral ink: a rising yield isn't simply good or bad news the way a price move is.
+                color = INK_2
+            elif symbol == "^VIX":
                 main = fmt_num(data.get("last_close"))
                 sub_val = data.get("last_session_pct")
                 sub = f"{arrow(sub_val)}{fmt_pct(sub_val)} last session"
@@ -327,18 +425,44 @@ class ReportFormatter:
                 )
                 color = pct_color(gap if gap is not None else data.get("last_session_pct"))
             cells.append(
-                f"<td width='33%' valign='top' style='padding:4px 8px 4px 0;'>"
+                f"<td width='{100 // len(names)}%' valign='top' style='padding:4px 8px 4px 0;'>"
                 f"<div style='font-size:12px;color:{INK_2};'>{e(names[symbol])}</div>"
                 f"<div style='font-size:18px;font-weight:600;margin-top:2px;'>{e(main)}</div>"
                 f"<div style='font-size:13px;color:{color};margin-top:2px;'>{e(sub)}</div></td>"
             )
-        if not cells:
+        lines = [
+            (label, text)
+            for label, text in (
+                ("Today (Central)", self.releases_line(ctx)),
+                ("Earnings this week", self.earnings_week_line(ctx)),
+            )
+            if text
+        ]
+        if not cells and not lines:
             return ""
-        inner = (
-            self._h2("Market backdrop")
-            + f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0'><tr>{''.join(cells)}</tr></table>"
+        table = (
+            f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0'><tr>{''.join(cells)}</tr></table>"
+            if cells
+            else ""
         )
-        return self._card(inner)
+        notes = "".join(
+            f"<div style='font-size:13px;color:{INK_2};margin-top:8px;'>"
+            f"<span style='font-weight:600;color:{INK};'>{e(label)}:</span> {e(text)}</div>"
+            for label, text in lines
+        )
+        return self._card(self._h2("Market backdrop") + table + notes)
+
+    def _html_why(self, item, label="Why:"):
+        """The 'why it's moving' text in body ink and size (it's for reading, not a footnote)."""
+        parts = self.why_parts(item)
+        if not parts:
+            return ""
+        text, source = parts
+        source_html = f"<span style='color:{MUTED};font-size:12px;'> — {e(source)}</span>" if source else ""
+        return (
+            f"<div style='font-size:14px;color:{INK};margin-top:8px;line-height:1.45;'>"
+            f"<span style='font-weight:600;'>{e(label)}</span> {e(text)}{source_html}</div>"
+        )
 
     def _html_headline_alerts(self, ctx):
         ranked = ctx["ranked"]
@@ -375,6 +499,7 @@ class ReportFormatter:
                 f"<div style='font-size:12px;color:{tone['color']};font-weight:600;margin-top:2px;'>"
                 f"{tone['arrow']} {tone['label']}</div>"
                 f"<ul style='margin:6px 0 0 0;padding-left:18px;font-size:14px;line-height:1.45;'>{alerts}</ul>"
+                f"{self._html_why(item)}"
                 f"</td></tr><tr><td style='height:10px;line-height:10px;font-size:0;'>&nbsp;</td></tr>"
             )
         inner = (
@@ -585,6 +710,7 @@ class ReportFormatter:
         inner = (
             f"<div style='overflow:hidden;'>{price_line}"
             f"<div style='font-size:20px;font-weight:600;'>{e(stock['symbol'])}</div>{name_line}</div>"
+            f"{self._html_why(stock, label=WHATS_MOVING_LABEL)}"
             f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0' style='margin-top:12px;border-collapse:collapse;'>{metric_rows}</table>"
             f"{alerts_html}{news_html}"
         )
@@ -733,6 +859,13 @@ class ReportFormatter:
     # ------------------------------------------------------------------ #
     # Plain-text twin: for clients that block HTML, and it helps spam scoring
     # ------------------------------------------------------------------ #
+    def _text_why(self, item, indent):
+        parts = self.why_parts(item)
+        if not parts:
+            return []
+        text, source = parts
+        return [f"{indent}Why: {text}" + (f" — {source}" if source else "")]
+
     def render_text(self, ctx: dict, pdf_attached: bool = False) -> str:
         lines = [f"{ctx['title'].upper()} — {ctx['date_label']}", ""]
 
@@ -746,7 +879,19 @@ class ReportFormatter:
                     )
             if "^VIX" in market:
                 parts.append(f"VIX {fmt_num(market['^VIX'].get('last_close'))}")
-            lines += ["MARKET: " + " | ".join(parts), ""]
+            if "^TNX" in market:
+                tnx = market["^TNX"]
+                parts.append(
+                    f"10-yr {fmt_pct(tnx.get('yield_pct'), signed=False, decimals=2)} "
+                    f"({fmt_bp(tnx.get('last_session_bp'))})"
+                )
+            lines.append("MARKET: " + " | ".join(parts))
+        if self.releases_line(ctx):
+            lines.append(f"TODAY (CENTRAL): {self.releases_line(ctx)}")
+        if self.earnings_week_line(ctx):
+            lines.append(f"EARNINGS THIS WEEK: {self.earnings_week_line(ctx)}")
+        if len(lines) > 2:
+            lines.append("")
 
         lines.append("BIG & CONCERNING MOVES")
         if not ctx["ranked"]:
@@ -759,6 +904,7 @@ class ReportFormatter:
                 f"  {item['symbol']} [{tone['label']}] {fmt_pct(item.get('gap_pct'))} {ctx['labels']['short']}"
             )
             lines += [f"    - {a['text']}" for a in item["alerts"]]
+            lines += self._text_why(item, "    ")
         lines.append("")
 
         lines.append("WATCHLIST")
@@ -777,6 +923,7 @@ class ReportFormatter:
 
         for stock in ctx["stocks"]:
             lines.append(f"{stock['symbol']} — {stock['metrics'].get('name') or ''}".rstrip(" —"))
+            lines += self._text_why(stock, "  ")
             lines += [f"  {k}: {v}" for k, v in self._metric_rows(stock)]
             lines += [f"  ! {a['text']}" for a in stock["alerts"]]
             for article in stock.get("top_news", [])[: ctx["news_per_stock"]]:

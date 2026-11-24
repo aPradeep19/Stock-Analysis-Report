@@ -10,6 +10,7 @@ balance-sheet figures and the market-mover screens.
 import time
 from datetime import datetime, timedelta
 from datetime import time as clock_time
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -19,6 +20,58 @@ import yfinance as yf
 MARKET_TZ = ZoneInfo("America/New_York")
 REGULAR_OPEN = clock_time(9, 30)
 REGULAR_CLOSE = clock_time(16, 0)
+
+
+def _unix_time(value):
+    """Unix seconds from Yahoo's epoch numbers or ISO strings ('2026-11-23T12:30:00Z'); None if unreadable."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        return int(pd.Timestamp(value).timestamp())
+    except (ValueError, TypeError):
+        return None
+
+
+def _positive(value):
+    """Price targets come through as 0.0 when a firm didn't publish one."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _url_key(url):
+    """
+    A URL for duplicate checks: lowercased, without utm_* tracking tags or a trailing slash.
+    The rest of the query string stays: Finnhub's links differ only by it (.../news?id=123).
+    """
+    parts = urlsplit((url or "").strip())
+    query = urlencode([(k, v) for k, v in parse_qsl(parts.query) if not k.lower().startswith("utm_")])
+    return urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), query, "")).lower()
+
+
+def merge_news(*sources, limit: int = 10) -> list:
+    """
+    Articles from several feeds, newest first, with duplicates dropped: the same URL, or the same
+    headline once case and punctuation are ignored (the same wire story syndicated twice).
+    """
+    seen_urls, seen_titles, merged = set(), set(), []
+    for article in sorted(
+        (a for source in sources for a in source or []), key=lambda a: a.get("datetime") or 0, reverse=True
+    ):
+        url = _url_key(article.get("url"))
+        title = "".join(ch for ch in (article.get("headline") or "").lower() if ch.isalnum())
+        duplicate = (url and url in seen_urls) or (title and title in seen_titles)
+        # Remember both keys even for a skipped duplicate: a third copy may match on the other one.
+        seen_urls.add(url)
+        seen_titles.add(title)
+        if duplicate:
+            continue
+        merged.append(article)
+    return merged[:limit]
 
 
 class FinnhubFetcher:
@@ -94,6 +147,23 @@ class FinnhubFetcher:
             )
             df = df[["open", "high", "low", "close", "volume"]]
 
+            # After the close Yahoo sometimes serves today's daily row with volume but no prices
+            # (seen Nov 2026). Dropping it would make yesterday the "last session" and label all of
+            # today's move as after-hours, so rebuild today's prices from its minute bars instead.
+            if (
+                df.index[-1].date() == now.date()
+                and pd.isna(df["close"].iloc[-1])
+                and now.time() >= REGULAR_CLOSE
+            ):
+                bar = self.regular_session_bar(symbol, now.date())
+                if bar:
+                    for column in ("open", "high", "low", "close"):
+                        df.iloc[-1, df.columns.get_loc(column)] = bar[column]
+                    if not df["volume"].iloc[-1] > 0:
+                        df.iloc[-1, df.columns.get_loc("volume")] = bar["volume"]
+                else:
+                    print(f"[WARN] {symbol}: today's daily bar has no prices and couldn't be rebuilt.")
+
             # Yahoo occasionally emits a price-less row (e.g. a dividend dated on a day that hasn't
             # traded yet). Without a close it's useless, so drop it, and backfill any missing
             # open/high/low from the close so downstream comparisons never see NaN.
@@ -108,6 +178,37 @@ class FinnhubFetcher:
         except Exception as e:
             print(f"[WARN] Failed to fetch historical data for {symbol} via yfinance: {e}")
             return pd.DataFrame()
+
+    @staticmethod
+    def regular_session_bar(symbol: str, day) -> dict | None:
+        """
+        Open/high/low/close/volume for `day`'s 9:30-4:00 session, built from Yahoo's 1-minute
+        bars. Used when the daily bar arrives without prices. None if there are no minute bars.
+        Minute volume can slightly undercount the official daily volume (closing auction), so
+        the daily row's own volume is preferred when it has one.
+        """
+        try:
+            bars = yf.Ticker(symbol).history(period="5d", interval="1m", prepost=False)
+        except Exception as e:
+            print(f"[WARN] {symbol} minute bars unavailable: {e}")
+            return None
+        if bars is None or bars.empty:
+            return None
+        index = bars.index
+        index = index.tz_localize(MARKET_TZ) if index.tz is None else index.tz_convert(MARKET_TZ)
+        bars = bars.set_axis(index)
+        times = bars.index.time
+        session = bars[(bars.index.date == day) & (times >= REGULAR_OPEN) & (times < REGULAR_CLOSE)]
+        session = session.dropna(subset=["Close"])
+        if session.empty:
+            return None
+        return {
+            "open": float(session["Open"].iloc[0]),
+            "high": float(session["High"].max()),
+            "low": float(session["Low"].min()),
+            "close": float(session["Close"].iloc[-1]),
+            "volume": float(session["Volume"].sum()),
+        }
 
     @staticmethod
     def drop_unfinished_bar(df: pd.DataFrame, now: datetime) -> pd.DataFrame:
@@ -209,6 +310,95 @@ class FinnhubFetcher:
             for article in data[:10]
         ]
 
+    @staticmethod
+    def get_yahoo_news(symbol: str, count: int = 10) -> list:
+        """
+        Recent headlines from Yahoo Finance, in the same shape as get_recent_news().
+
+        A second source because Finnhub often hasn't picked up overnight press releases by the
+        8 AM run. Yahoo has changed this payload before, so both its older flat format and the
+        current nested 'content' format are read, and any failure returns [] (with a warning).
+        """
+        try:
+            raw = yf.Ticker(symbol).get_news(count=count) or []
+        except Exception as e:
+            print(f"    [WARN] {symbol} Yahoo news unavailable: {type(e).__name__}: {str(e)[:120]}")
+            return []
+
+        articles = []
+        for item in raw:
+            content = item.get("content") if isinstance(item.get("content"), dict) else item
+            headline = (content.get("title") or "").strip()
+            published = _unix_time(content.get("pubDate") or content.get("providerPublishTime"))
+            if not headline or published is None:
+                continue
+            provider = content.get("provider") or {}
+            url = (
+                (content.get("canonicalUrl") or {}).get("url")
+                or (content.get("clickThroughUrl") or {}).get("url")
+                or content.get("link")
+            )
+            articles.append(
+                {
+                    "headline": headline,
+                    "url": url,
+                    "summary": content.get("summary") or content.get("description") or "",
+                    "source": provider.get("displayName") or content.get("publisher") or "Yahoo Finance",
+                    "datetime": published,
+                }
+            )
+        return sorted(articles, key=lambda a: a["datetime"], reverse=True)
+
+    @staticmethod
+    def get_rating_changes(symbol: str, since: datetime) -> list:
+        """
+        Analyst rating and price-target changes from Yahoo published after `since`, newest first.
+
+        Yahoo's timestamps carry no time zone; they're read as UTC, which matches when firms
+        typically publish (before the US open).
+        """
+        try:
+            table = yf.Ticker(symbol).upgrades_downgrades
+        except Exception as e:
+            print(f"    [WARN] {symbol} analyst ratings unavailable: {type(e).__name__}: {str(e)[:120]}")
+            return []
+        if table is None or table.empty:
+            return []
+
+        index = pd.to_datetime(table.index)
+        index = index.tz_localize("UTC") if index.tz is None else index
+        table = table.set_axis(index.tz_convert(MARKET_TZ)).sort_index(ascending=False)
+        changes = []
+        for when, row in table[table.index > since].iterrows():
+            changes.append(
+                {
+                    "datetime": int(when.timestamp()),
+                    "firm": str(row.get("Firm") or "").strip(),
+                    "action": str(row.get("Action") or "").strip(),  # up / down / main / init / reit
+                    "from_grade": str(row.get("FromGrade") or "").strip(),
+                    "to_grade": str(row.get("ToGrade") or "").strip(),
+                    "prior_target": _positive(row.get("priorPriceTarget")),
+                    "target": _positive(row.get("currentPriceTarget")),
+                }
+            )
+        return changes
+
+    @staticmethod
+    def get_daily_closes(symbols: list, period: str = "1y") -> pd.DataFrame:
+        """Daily closes for several symbols in one Yahoo request (dates x symbols), or empty."""
+        try:
+            data = yf.download(symbols, period=period, interval="1d", auto_adjust=True, progress=False)
+        except Exception as e:
+            print(f"[WARN] Daily closes for {', '.join(symbols)} failed: {e}")
+            return pd.DataFrame()
+        if data is None or data.empty:
+            return pd.DataFrame()
+        closes = data["Close"] if "Close" in data else data
+        if isinstance(closes, pd.Series):
+            closes = closes.to_frame(symbols[0])
+        closes.index = pd.to_datetime(closes.index).tz_localize(None)
+        return closes.sort_index()
+
     def get_key_metrics(self, symbol: str) -> dict:
         """
         A few fundamentals from Finnhub's free /stock/metric endpoint.
@@ -299,6 +489,9 @@ class FinnhubFetcher:
             "operating_cashflow_m": millions("operatingCashflow"),
             "market_cap_m": market_cap / 1e6 if market_cap else None,
             "beta": info.get("beta"),
+            # Yahoo's classification, used to pick a sector fund when price history can't (sectors.py).
+            "yahoo_sector": info.get("sector"),
+            "yahoo_industry": info.get("industry"),
         }
 
     @staticmethod

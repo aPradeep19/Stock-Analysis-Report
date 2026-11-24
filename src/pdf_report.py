@@ -1,19 +1,24 @@
 """
 The PDF newsletter.
 
-Layout: a header page (market backdrop, big & concerning moves, watchlist table, movers), then
-one page per stock (chart, key metrics, alerts and signals, headlines), then a closing page
-explaining the positioning levels.
+Layout, fixed so readers always know where to look:
+  page 1     front page: title, market backdrop, big & concerning moves (also the README preview)
+  page 2     watchlist at a glance, market movers (and room for future sections)
+  one page per stock: chart, key metrics, alerts and signals, headlines
+  last page  how alerts work, and what each positioning level means
+
+Every page is fitted before it's handed to reportlab: each section offers versions from richest
+to most compact, they're measured with wrap(), and the richest set that fits is used. Pages never
+spill, and text is never made smaller to make room.
 
 - Built from the same context as the email (src/formatter.py), so the two always agree.
-- reportlab's platypus handles page flow from a list of flowables, so a long header page just
-  spills onto page 2.
 - The built-in Helvetica has no glyphs for ▲ ▼, so the PDF relies on signs, colored bullets
   and words (UP / DOWN / WATCH) instead of the email's arrows.
 - reportlab and matplotlib are pure pip installs with no system libraries, so the PDF renders
   the same locally and on GitHub's Linux runners.
 """
 
+import io
 from xml.sax.saxutils import escape
 
 from reportlab.lib import colors
@@ -21,12 +26,15 @@ from reportlab.lib.enums import TA_RIGHT
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import inch
+from reportlab.pdfgen.canvas import Canvas
 from reportlab.platypus import (
+    BaseDocTemplate,
+    Frame,
     Image,
     KeepTogether,
     PageBreak,
+    PageTemplate,
     Paragraph,
-    SimpleDocTemplate,
     Spacer,
     Table,
     TableStyle,
@@ -40,6 +48,7 @@ from src.formatter import (
     INK_2,
     MUTED,
     UP_TEXT,
+    fmt_bp,
     fmt_money,
     fmt_num,
     fmt_pct,
@@ -53,14 +62,42 @@ TONE_PDF = {
     "up": {"color": UP_TEXT, "label": "UP"},
     "caution": {"color": "#a86e00", "label": "WATCH"},
 }
+
 PAGE_W, PAGE_H = letter
 MARGIN = 0.6 * inch
+TOP_MARGIN = MARGIN
+BOTTOM_MARGIN = MARGIN + 10  # leaves room for the footer line
 CONTENT_W = PAGE_W - 2 * MARGIN
-# Usable height inside a page: page minus the margins passed in build(), minus the frame's 6pt
-# padding top and bottom, minus 2pt of slack so rounding never pushes an exactly-fitting block
-# onto the next page. Keep in sync with build().
-FRAME_H = PAGE_H - MARGIN - (MARGIN + 10) - 12 - 2
-CHART_MIN_SCALE = 0.6  # charts shrink to make room for long signal lists, but no further
+# build() uses an unpadded frame exactly CONTENT_W wide, so what's measured here is what gets laid
+# out, and paragraphs line up with full-width tables. 2pt of slack keeps rounding from pushing an
+# exactly-fitting page onto the next one.
+FRAME_H = PAGE_H - TOP_MARGIN - BOTTOM_MARGIN - 2
+
+CHART_ASPECT = 3.3 / 7.3  # height / width of price_volume_chart()'s native figure
+CHART_MIN_SCALE = 0.6  # the chart shrinks to this before any signal is trimmed
+CHART_LAST_RESORT_SCALE = 0.45  # only once every signal is gone; below this the chart is dropped
+HEADLINE_MAX_LINES = 2
+
+# Signals whose figure already appears in Key metrics or Alerts, so the PDF page skips them.
+REDUNDANT_SIGNALS = frozenset(
+    {
+        "premarket",
+        "last_session",
+        "volume",
+        "short_interest",
+        "open_interest",
+        "calls_expiring",
+        "ownership",
+        "net_debt",
+    }
+)
+# When a page is still too tall, signals go in this order, least informative first. Kinds not
+# listed (including untagged ones) are treated as the most valuable and go last.
+SIGNAL_TRIM_ORDER = ("sma_20", "rsi", "sma_200", "sma_50", "valuation", "cash_runway")
+
+# wrap() needs a canvas for some flowables (KeepTogether, tables of paragraphs); measuring never
+# draws, so a throwaway in-memory one is enough.
+_MEASURE_CANVAS = Canvas(io.BytesIO())
 
 
 def _styles():
@@ -101,6 +138,12 @@ def _styles():
         "bullet": ParagraphStyle(
             "bullet", **{**base, "leftIndent": 10, "bulletIndent": 0, "spaceAfter": 1.5}
         ),
+        "note": ParagraphStyle(
+            "note",
+            **{**base, "fontSize": 8.5, "leading": 11, "textColor": colors.HexColor(INK_2), "spaceBefore": 4},
+        ),
+        # The 'why it's moving' text is something to read, not a footnote: full ink, near body size.
+        "why": ParagraphStyle("why", **{**base, "fontSize": 9, "leading": 12, "spaceBefore": 3}),
         # Hanging indent for lines that carry their own colored bullet in the text.
         "hang": ParagraphStyle("hang", **{**base, "leftIndent": 10, "firstLineIndent": -10, "spaceAfter": 2}),
     }
@@ -115,6 +158,108 @@ def _pct_markup(value, decimals=1, bold=True):
     return f"<font color='{color}'>{'<b>' if bold else ''}{text}{'</b>' if bold else ''}</font>"
 
 
+# ---------------------------------------------------------------------- #
+# Measuring and fitting
+# ---------------------------------------------------------------------- #
+def _height(flowables, width=CONTENT_W):
+    """
+    Height a list of flowables takes in a frame `width` wide, spacing included.
+
+    Slightly pessimistic on purpose: a frame drops the first flowable's spaceBefore at the top
+    of a page, which this counts anyway.
+    """
+    total = 0.0
+    for flowable in flowables:
+        # KeepTogether reports a huge sentinel height from wrap(); measure what it holds instead.
+        parts = flowable._content if isinstance(flowable, KeepTogether) else [flowable]
+        for part in parts:
+            _, h = part.wrapOn(_MEASURE_CANVAS, width, FRAME_H * 10)
+            total += h + part.getSpaceBefore() + part.getSpaceAfter()
+    return total
+
+
+def _fit_sections(sections, budget=FRAME_H):
+    """
+    Lays sections out top to bottom within `budget` points.
+
+    Each section is a list of versions (each a list of flowables), richest first. A section gets
+    the richest version that fits the space left after the sections above it, so new sections
+    only need to describe their versions; nothing here counts rows by hand.
+    """
+    story = []
+    remaining = budget
+    for name, versions in sections:
+        for version in versions:
+            height = _height(version)
+            if height <= remaining:
+                break
+        else:
+            print(f"    [WARN] PDF: '{name}' doesn't fit its page even at its most compact; it will spill.")
+        story += version
+        remaining -= height
+    return story
+
+
+def _line_count(paragraph, width):
+    paragraph.wrapOn(_MEASURE_CANVAS, width, FRAME_H * 10)
+    return len(paragraph.blPara.lines)
+
+
+def _clip(text, length):
+    """`text` cut to about `length` characters at a word boundary when one is close, plus '…'."""
+    cut = text[:length].rstrip()
+    space = cut.rfind(" ")
+    if 0 < space and length - space < 15:
+        cut = cut[:space]
+    return cut.rstrip(" ,;:-–—") + "…"
+
+
+def _fit_lines(make, text, width, max_lines):
+    """
+    make(text) -> Paragraph, with `text` (plain, unescaped) shortened until the paragraph is at
+    most `max_lines` lines at `width`. Text is cut, never shrunk.
+    """
+    paragraph = make(text)
+    if _line_count(paragraph, width) <= max_lines:
+        return paragraph
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _line_count(make(_clip(text, mid)), width) <= max_lines:
+            lo = mid
+        else:
+            hi = mid - 1
+    return make(_clip(text, lo))
+
+
+def _page_signals(stock):
+    """(kind, text) for the signals worth showing on the PDF page, in the analyzer's order."""
+    signals = stock.get("signals")
+    if signals is None:  # results built without kinds: show everything, trim it last
+        signals = [{"text": text, "kind": None} for text in stock.get("triggers", [])]
+    return [(s["kind"], s["text"]) for s in signals if s["kind"] not in REDUNDANT_SIGNALS]
+
+
+def _signal_trims(signals):
+    """Yields the signal list, then shorter and shorter versions of it, down to empty."""
+    yield list(signals)
+    rank = {kind: i for i, kind in enumerate(SIGNAL_TRIM_ORDER)}
+    order = sorted(range(len(signals)), key=lambda i: rank.get(signals[i][0], len(rank)))
+    dropped = set()
+    for index in order:
+        dropped.add(index)
+        yield [s for i, s in enumerate(signals) if i not in dropped]
+
+
+def _tight(table, **padding):
+    """Applies zero padding (or the given overrides) plus top alignment to a layout table."""
+    pad = {"LEFTPADDING": 0, "RIGHTPADDING": 0, "TOPPADDING": 0, "BOTTOMPADDING": 0, **padding}
+    table.setStyle(
+        TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")] + [(k, (0, 0), (-1, -1), v) for k, v in pad.items()])
+    )
+    return table
+
+
 class NewsletterPDF:
     def __init__(self, formatter):
         # The email formatter supplies the metric rows and positioning guide, so the PDF can't
@@ -124,22 +269,22 @@ class NewsletterPDF:
 
     def build(self, ctx: dict, pipeline_data: dict, path: str) -> str:
         """Writes the PDF to `path` and returns it. `pipeline_data` supplies raw candles for charts."""
-        doc = SimpleDocTemplate(
+        doc = BaseDocTemplate(
             path,
             pagesize=letter,
             leftMargin=MARGIN,
             rightMargin=MARGIN,
-            topMargin=MARGIN,
-            bottomMargin=MARGIN + 10,
+            topMargin=TOP_MARGIN,
+            bottomMargin=BOTTOM_MARGIN,
             title=f"{ctx['title']} — {ctx['date_label']}",
             author="Stock-Analysis-Report",
         )
-        story = self._header_page(ctx)
+        story = self._front_page(ctx) + [PageBreak()] + self._overview_page(ctx)
         for stock in ctx["stocks"]:
             story.append(PageBreak())
             story += self._stock_page(stock, ctx, pipeline_data.get(stock["symbol"], {}))
         story.append(PageBreak())
-        story += self._positioning_page()
+        story += self._guide_page(ctx)
 
         def footer(canvas, _doc):
             canvas.saveState()
@@ -153,19 +298,40 @@ class NewsletterPDF:
             canvas.drawRightString(PAGE_W - MARGIN, MARGIN * 0.6, f"Page {canvas.getPageNumber()}")
             canvas.restoreState()
 
-        doc.build(story, onFirstPage=footer, onLaterPages=footer)
+        # No frame padding (reportlab's default is 6pt a side); see FRAME_H.
+        frame = Frame(
+            MARGIN,
+            BOTTOM_MARGIN,
+            CONTENT_W,
+            PAGE_H - TOP_MARGIN - BOTTOM_MARGIN,
+            leftPadding=0,
+            rightPadding=0,
+            topPadding=0,
+            bottomPadding=0,
+        )
+        doc.addPageTemplates([PageTemplate(id="page", frames=[frame], onPage=footer)])
+        doc.build(story)
         return path
 
     # ------------------------------------------------------------------ #
-    # Page 1: the header page
+    # Page 1: front page (src/preview.py turns it into the README image)
     # ------------------------------------------------------------------ #
-    def _header_page(self, ctx):
+    def _front_page(self, ctx):
+        return _fit_sections(
+            [
+                ("title", [self._masthead(ctx)]),
+                ("market backdrop", [self._backdrop(ctx)]),
+                ("big & concerning moves", self._ranked_versions(ctx)),
+            ]
+        )
+
+    def _masthead(self, ctx):
         s = self.s
         as_of = ctx["as_of"]
         as_of_text = (
             f"Prices as of {as_of:%I:%M %p} ET".replace(" 0", " ") if as_of else "No pre-market trades yet"
         )
-        story = [
+        return [
             # Plain-text fields still go through escape(): reportlab parses Paragraph text as markup.
             Paragraph(escape(ctx["title"].upper()), s["kicker"]),
             Paragraph(escape(ctx["date_label"]), s["title"]),
@@ -175,17 +341,24 @@ class NewsletterPDF:
             ),
         ]
 
+    def _backdrop(self, ctx):
+        s = self.s
         market = ctx["market"]
         tiles = []
         for symbol, name in (
             ("SPY", "S&amp;P 500 (SPY)"),
             ("QQQ", "Nasdaq-100 (QQQ)"),
             ("^VIX", "VIX fear gauge"),
+            ("^TNX", "10-yr Treasury"),
         ):
             data = market.get(symbol)
             if not data:
                 continue
-            if symbol == "^VIX":
+            if symbol == "^TNX":
+                value = fmt_pct(data.get("yield_pct"), signed=False, decimals=2)
+                # Neutral ink: a rising yield isn't simply good or bad news the way a price move is.
+                sub = f"<b>{fmt_bp(data.get('last_session_bp'))}</b> last session"
+            elif symbol == "^VIX":
                 value = fmt_num(data.get("last_close"))
                 change = data.get("last_session_pct")
                 # A rising VIX means rising fear, so color it like a loss (the sign stays true).
@@ -203,73 +376,146 @@ class NewsletterPDF:
                     Paragraph(sub, s["small"]),
                 ]
             )
+        notes = [
+            Paragraph(f"<font color='{INK}'><b>{label}:</b></font> {escape(text)}", s["note"])
+            for label, text in (
+                ("Today (Central)", self.formatter.releases_line(ctx)),
+                ("Earnings this week", self.formatter.earnings_week_line(ctx)),
+            )
+            if text
+        ]
+        if not tiles and not notes:
+            return []
+        story = [Paragraph("Market backdrop", s["h2"])]
         if tiles:
-            story.append(Paragraph("Market backdrop", s["h2"]))
             table = Table([tiles], colWidths=[CONTENT_W / len(tiles)] * len(tiles))
             table.setStyle(
                 TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0)])
             )
             story.append(table)
+        return story + notes
 
-        story.append(Paragraph("Big &amp; concerning moves", s["h2"]))
+    def _why(self, item, width, max_lines, label="Why:", style="why"):
+        """The 'Why: …  — Sources' text, cut to `max_lines`, or None when there isn't one."""
+        parts = self.formatter.why_parts(item)
+        if not parts:
+            return None
+        text, source = parts
+        prefix = f"<b>{label}</b> " if label else ""
+        suffix = f" <font size='7.5' color='{MUTED}'>— {escape(source)}</font>" if source else ""
+        return _fit_lines(
+            lambda t: Paragraph(f"{prefix}{escape(t)}{suffix}", self.s[style]),
+            text,
+            width,
+            max_lines,
+        )
+
+    def _ranked_versions(self, ctx):
+        """
+        Versions of "Big & concerning moves": the first k ranked stocks get their full alert list
+        and the rest one line each (with up to two lines of 'why'), for k = all, all - 1, ..., 0.
+        The last resort cuts every 'why' to one line. Every ranked stock appears in every
+        version; only the detail shrinks, and the most urgent stocks keep theirs longest.
+        """
+        s = self.s
+        heading = Paragraph("Big &amp; concerning moves", s["h2"])
         if not ctx["ranked"]:
-            story.append(
-                Paragraph(
-                    f"Nothing crossed your thresholds this morning. All {len(ctx['stocks'])} "
-                    f"stocks are trading within their normal ranges.",
-                    s["body"],
-                )
+            note = Paragraph(
+                f"Nothing crossed your thresholds this morning. All {len(ctx['stocks'])} "
+                f"stocks are trading within their normal ranges.",
+                s["body"],
             )
-        for item in ctx["ranked"]:
-            tone = TONE_PDF[item["tone"]]
-            name = (
-                f" <font color='{INK_2}'>{escape(item.get('name') or '')}</font>" if item.get("name") else ""
-            )
-            gap = item.get("gap_pct")
-            head = Table(
-                [
-                    [
-                        Paragraph(
-                            f"<b>{escape(item['symbol'])}</b>{name}  "
-                            f"<font size='7.5' color='{tone['color']}'><b>{tone['label']}</b></font>",
-                            s["body"],
-                        ),
-                        Paragraph(
-                            f"{_pct_markup(gap)} {ctx['labels']['short']}" if gap is not None else "",
-                            s["cell_r"],
-                        ),
-                    ]
-                ],
-                colWidths=[CONTENT_W * 0.72 - 12, CONTENT_W * 0.28],
-            )
-            head.setStyle(
-                TableStyle(
-                    [
-                        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-                        ("TOPPADDING", (0, 0), (-1, -1), 0),
-                        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-                    ]
-                )
-            )
-            bullets = [Paragraph(escape(a["text"]), s["bullet"], bulletText="•") for a in item["alerts"]]
-            # A one-cell table gives the block its colored left rule, and KeepTogether stops a
-            # stock's alerts from splitting across pages.
-            block = Table([[[head] + bullets]], colWidths=[CONTENT_W])
-            block.setStyle(
-                TableStyle(
-                    [
-                        ("LINEBEFORE", (0, 0), (0, -1), 3, colors.HexColor(tone["color"])),
-                        ("LEFTPADDING", (0, 0), (-1, -1), 10),
-                        ("TOPPADDING", (0, 0), (-1, -1), 4),
-                        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-                    ]
-                )
-            )
-            story += [KeepTogether(block), Spacer(1, 6)]
+            return [[heading, note]]
 
+        full = [[KeepTogether(self._ranked_block(item, ctx)), Spacer(1, 6)] for item in ctx["ranked"]]
+        short = [[self._ranked_line(item, ctx), Spacer(1, 4)] for item in ctx["ranked"]]
+        versions = []
+        for k in range(len(full), -1, -1):
+            version = [heading]
+            for i in range(len(full)):
+                version += full[i] if i < k else short[i]
+            versions.append(version)
+        shortest = [[self._ranked_line(item, ctx, why_lines=1), Spacer(1, 4)] for item in ctx["ranked"]]
+        versions.append([heading] + [flowable for row in shortest for flowable in row])
+        return versions
+
+    def _ranked_frame(self, content, tone, top=4, bottom=4):
+        """One-cell table that draws a stock's colored rule down its left edge."""
+        block = Table([[content]], colWidths=[CONTENT_W])
+        block.setStyle(
+            TableStyle(
+                [
+                    ("LINEBEFORE", (0, 0), (0, -1), 3, colors.HexColor(tone["color"])),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 10),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                    ("TOPPADDING", (0, 0), (-1, -1), top),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), bottom),
+                ]
+            )
+        )
+        return block
+
+    def _ranked_block(self, item, ctx):
+        s = self.s
+        tone = TONE_PDF[item["tone"]]
+        inner_w = CONTENT_W - 16  # the frame's 10pt left and 6pt right padding
+        name = f" <font color='{INK_2}'>{escape(item.get('name') or '')}</font>" if item.get("name") else ""
+        gap = item.get("gap_pct")
+        head = Table(
+            [
+                [
+                    Paragraph(
+                        f"<b>{escape(item['symbol'])}</b>{name}  "
+                        f"<font size='7.5' color='{tone['color']}'><b>{tone['label']}</b></font>",
+                        s["body"],
+                    ),
+                    Paragraph(
+                        f"{_pct_markup(gap)} {ctx['labels']['short']}" if gap is not None else "",
+                        s["cell_r"],
+                    ),
+                ]
+            ],
+            colWidths=[inner_w * 0.72, inner_w * 0.28],
+        )
+        _tight(head, BOTTOMPADDING=2)
+        bullets = [Paragraph(escape(a["text"]), s["bullet"], bulletText="•") for a in item["alerts"]]
+        why = self._why(item, inner_w, 3)
+        return self._ranked_frame([head] + bullets + ([why] if why else []), tone)
+
+    def _ranked_line(self, item, ctx, why_lines=2):
+        """The compact form: ticker, tone, gap and top alert on one line, then the 'why'."""
+        s = self.s
+        tone = TONE_PDF[item["tone"]]
+        gap = item.get("gap_pct")
+        gap_text = f"{_pct_markup(gap)} {ctx['labels']['short']}  ·  " if gap is not None else ""
+        prefix = (
+            f"<b>{escape(item['symbol'])}</b>  "
+            f"<font size='7.5' color='{tone['color']}'><b>{tone['label']}</b></font>  {gap_text}"
+        )
+        line = _fit_lines(
+            lambda text: Paragraph(prefix + escape(text), s["body"]),
+            item["alerts"][0]["text"],
+            CONTENT_W - 16,
+            1,
+        )
+        why = self._why(item, CONTENT_W - 16, why_lines)
+        return self._ranked_frame([line, why] if why else line, tone, top=3, bottom=3)
+
+    # ------------------------------------------------------------------ #
+    # Page 2: the whole watchlist and the wider market
+    # ------------------------------------------------------------------ #
+    def _overview_page(self, ctx):
+        # A future section (e.g. a scorecard) slots in here as another (name, versions) pair.
+        return _fit_sections(
+            [
+                ("watchlist at a glance", [self._watchlist(ctx)]),
+                ("outside your watchlist", self._movers_versions(ctx)),
+            ]
+        )
+
+    def _watchlist(self, ctx):
+        s = self.s
         # The page is wide enough for two more columns than the email's phone-sized table.
-        story.append(Paragraph("Watchlist at a glance", s["h2"]))
         header = [
             "Ticker",
             ctx["labels"]["col"],
@@ -319,22 +565,26 @@ class NewsletterPDF:
         for r in range(len(ctx["stocks"]) + 1, len(rows)):
             style.append(("SPAN", (1, r), (-1, r)))
         table.setStyle(TableStyle(style))
-        story.append(table)
+        return [Paragraph("Watchlist at a glance", s["h2"]), table]
 
+    def _movers_versions(self, ctx):
+        """Market movers with every row, then one fewer row per screen, down to one."""
+        s = self.s
         movers = ctx["movers"]
-        if movers and any(movers.values()):
-            story.append(Paragraph("Outside your watchlist", s["h2"]))
-            story.append(
-                Paragraph("Biggest US movers in the last regular session (Yahoo Finance screens)", s["small"])
-            )
+        if not movers or not any(movers.values()):
+            return [[]]
+        screens = (
+            ("day_gainers", "Top gainers"),
+            ("day_losers", "Top losers"),
+            ("most_actives", "Most active"),
+        )
+        most = max(len(movers.get(key, [])) for key, _ in screens)
+        versions = []
+        for rows in range(most, 0, -1):
             cols = []
-            for key, title in (
-                ("day_gainers", "Top gainers"),
-                ("day_losers", "Top losers"),
-                ("most_actives", "Most active"),
-            ):
+            for key, title in screens:
                 lines = [Paragraph(f"<b>{title}</b>", s["cell"])]
-                for q in movers.get(key, []):
+                for q in movers.get(key, [])[:rows]:
                     lines.append(
                         Paragraph(
                             f"{escape(q.get('symbol') or '')}  {_pct_markup(q.get('change_pct'), bold=False)}",
@@ -343,37 +593,65 @@ class NewsletterPDF:
                     )
                 cols.append(lines)
             table = Table([cols], colWidths=[CONTENT_W / 3] * 3)
-            table.setStyle(
-                TableStyle(
-                    [
-                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                        ("TOPPADDING", (0, 0), (-1, -1), 6),
-                    ]
-                )
+            _tight(table, TOPPADDING=6)
+            versions.append(
+                [
+                    Paragraph("Outside your watchlist", s["h2"]),
+                    Paragraph(
+                        "Biggest US movers in the last regular session (Yahoo Finance screens)", s["small"]
+                    ),
+                    table,
+                ]
             )
-            story.append(table)
-
-        t = ctx["thresholds"]
-        story += [
-            Spacer(1, 14),
-            Paragraph(
-                f"How alerts work: a pre-market gap of ±{t.get('premarket_gap_pct', 3.0):g}% or a last-session move of "
-                f"±{t.get('price_change_pct', 5.0):g}% (when it's at least a normal-sized move for that stock), or any move of "
-                f"{t.get('unusual_move_sigma', 2.0):g}x the stock's typical daily move; volume at "
-                f"{t.get('volume_surge_multiplier', 2.0):g}x its 20-day average; RSI outside "
-                f"{t.get('rsi_oversold', 30)}–{t.get('rsi_overbought', 70)}; a close through the 50- or 200-day average; "
-                f"a 52-week high or low; earnings within {t.get('earnings_lookahead_days', 7)} days. Data: Finnhub and "
-                f"Yahoo Finance.",
-                s["small"],
-            ),
-        ]
-        return story
+        return versions
 
     # ------------------------------------------------------------------ #
     # One page per stock
     # ------------------------------------------------------------------ #
     def _stock_page(self, stock, ctx, raw):
+        """
+        Exactly one page: heading, chart, key metrics beside alerts and signals, headlines.
+
+        Everything except the chart has a natural height, so the chart gets whatever is left. If
+        that's under CHART_MIN_SCALE of full size, the least useful signals are dropped one at a
+        time until it isn't. Key metrics, alerts and headlines are never trimmed.
+        """
+        m = stock["metrics"]
+        why = self._why(stock, CONTENT_W, 4, label=None, style="body")
+        # 'What's moving it' sits under the heading and is measured with it.
+        top = [self._stock_heading(stock)]
+        if why:
+            top += [Paragraph("What's moving it", self.s["h3"]), why]
+        left = self._metrics_column(stock)
+        alerts = self._alert_lines(stock)
+        news = self._headlines(stock, ctx)
+
+        candles = raw.get("candles")
+        has_chart = candles is not None and not candles.empty
+        full_chart = CONTENT_W * CHART_ASPECT if has_chart else 0.0
+        min_chart = full_chart * CHART_MIN_SCALE
+
+        for shown in _signal_trims(_page_signals(stock)):
+            columns = self._columns(left, alerts, [text for _, text in shown])
+            text_flowables = top + [Spacer(1, 8), Spacer(1, 4), columns] + news
+            room = FRAME_H - _height(text_flowables)
+            if room >= min_chart:
+                break
+
+        chart_height = min(full_chart, room)
+        if has_chart and chart_height < full_chart * CHART_LAST_RESORT_SCALE:
+            print(f"    [WARN] PDF: no room for {stock['symbol']}'s chart; leaving it out.")
+            has_chart = False
+        if room < 0:
+            print(f"    [WARN] PDF: {stock['symbol']}'s page is {-room:.0f}pt too tall and will spill.")
+
+        story = top + [Spacer(1, 8)]
+        if has_chart:
+            png = price_volume_chart(candles, m)
+            story.append(Image(png, width=CONTENT_W, height=chart_height, kind="proportional"))
+        return story + [Spacer(1, 4), columns] + news
+
+    def _stock_heading(self, stock):
         s = self.s
         m = stock["metrics"]
         name_bits = " · ".join(escape(b) for b in (m.get("name"), m.get("industry")) if b)
@@ -399,24 +677,16 @@ class NewsletterPDF:
             ],
             colWidths=[CONTENT_W * 0.65, CONTENT_W * 0.35],
         )
-        top.setStyle(
-            TableStyle(
-                [
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-                ]
-            )
-        )
-        story = [top, Spacer(1, 8)]
+        return _tight(top, TOPPADDING=3, BOTTOMPADDING=3)
 
-        # Two columns: every key metric on the left, alerts and signals on the right.
-        metric_rows = [
+    def _metrics_column(self, stock):
+        s = self.s
+        rows = [
             [Paragraph(escape(k), s["small"]), Paragraph(escape(v), s["cell_r"])]
             for k, v in self.formatter._metric_rows(stock)
         ]
-        metrics_table = Table(metric_rows, colWidths=[CONTENT_W * 0.22, CONTENT_W * 0.24])
-        metrics_table.setStyle(
+        table = Table(rows, colWidths=[CONTENT_W * 0.22, CONTENT_W * 0.24])
+        table.setStyle(
             TableStyle(
                 [
                     ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor(HAIRLINE)),
@@ -428,30 +698,31 @@ class NewsletterPDF:
                 ]
             )
         )
-        left = [Paragraph("Key metrics", s["h3"]), metrics_table]
+        return [Paragraph("Key metrics", s["h3"]), table]
 
-        right = [Paragraph("Alerts", s["h3"])]
-        if stock["alerts"]:
-            for a in stock["alerts"]:
-                color = TONE_PDF[a["direction"]]["color"]
-                # bulletText can't carry markup, so the colored bullet goes in the text itself.
-                right.append(
-                    Paragraph(f"<font color='{color}'>•</font>&nbsp;&nbsp;{escape(a['text'])}", s["hang"])
-                )
-        else:
-            right.append(Paragraph("No alerts: everything within normal ranges.", s["small"]))
-        right.append(Paragraph("Signals", s["h3"]))
-        for t in stock["triggers"]:
-            right.append(
-                Paragraph(
-                    escape(t),
-                    ParagraphStyle(
-                        "sig", parent=s["bullet"], fontSize=8.5, leading=11, textColor=colors.HexColor(INK_2)
-                    ),
-                    bulletText="•",
-                )
+    def _alert_lines(self, stock):
+        s = self.s
+        lines = [Paragraph("Alerts", s["h3"])]
+        if not stock["alerts"]:
+            return lines + [Paragraph("No alerts: everything within normal ranges.", s["small"])]
+        for a in stock["alerts"]:
+            color = TONE_PDF[a["direction"]]["color"]
+            # bulletText can't carry markup, so the colored bullet goes in the text itself.
+            lines.append(
+                Paragraph(f"<font color='{color}'>•</font>&nbsp;&nbsp;{escape(a['text'])}", s["hang"])
             )
+        return lines
 
+    def _columns(self, left, alerts, signals):
+        """Key metrics on the left; alerts, then any signals, on the right."""
+        s = self.s
+        right = list(alerts)
+        if signals:
+            style = ParagraphStyle(
+                "sig", parent=s["bullet"], fontSize=8.5, leading=11, textColor=colors.HexColor(INK_2)
+            )
+            right.append(Paragraph("Signals", s["h3"]))
+            right += [Paragraph(escape(text), style, bulletText="•") for text in signals]
         columns = Table([[left, right]], colWidths=[CONTENT_W * 0.48, CONTENT_W * 0.52])
         columns.setStyle(
             TableStyle(
@@ -463,51 +734,57 @@ class NewsletterPDF:
                 ]
             )
         )
+        return columns
 
-        # The two-column block is a single table row, so it can't split across pages. If it didn't
-        # fit under the chart it would jump to the next page and strand the chart, so stocks with
-        # long signal lists get a shorter chart instead (down to CHART_MIN_SCALE). 3.3 / 7.3 is
-        # the chart's native aspect ratio from price_volume_chart().
-        candles = raw.get("candles")
-        if candles is not None and not candles.empty:
-            full = CONTENT_W * 3.3 / 7.3
-            spare = FRAME_H - top.wrap(CONTENT_W, FRAME_H)[1] - 12 - columns.wrap(CONTENT_W, FRAME_H)[1]
-            height = max(min(full, spare), full * CHART_MIN_SCALE)
-            png = price_volume_chart(candles, m)
-            story.append(Image(png, width=CONTENT_W, height=height, kind="proportional"))
-        story += [Spacer(1, 4), columns]
-
+    def _headlines(self, stock, ctx):
+        """Headlines block, each headline (with its source) capped at HEADLINE_MAX_LINES lines."""
+        s = self.s
         news = stock.get("top_news", [])[: ctx["news_per_stock"]]
-        if news:
-            sd = stock.get("sentiment_detail", {})
-            story.append(
-                Paragraph(
-                    f"Headlines <font name='Helvetica' size='8.5' color='{INK_2}'>· sentiment {escape(stock['sentiment'])} "
-                    f"({sd.get('positive', 0)} positive, {sd.get('negative', 0)} negative, "
-                    f"{sd.get('neutral', 0)} neutral)</font>",
-                    s["h3"],
-                )
+        if not news:
+            return []
+        sd = stock.get("sentiment_detail", {})
+        story = [
+            Paragraph(
+                f"Headlines <font name='Helvetica' size='8.5' color='{INK_2}'>· sentiment {escape(stock['sentiment'])} "
+                f"({sd.get('positive', 0)} positive, {sd.get('negative', 0)} negative, "
+                f"{sd.get('neutral', 0)} neutral)</font>",
+                s["h3"],
             )
-            for article in news:
-                headline = escape(article.get("headline") or "Untitled")
-                url = safe_url(article.get("url"))
+        ]
+        style = ParagraphStyle("news", parent=s["bullet"], fontSize=9)
+        for article in news:
+            url = safe_url(article.get("url"))
+            source = escape(article.get("source") or "")
+            suffix = f" <font size='7.5' color='{MUTED}'>— {source}</font>" if source else ""
+
+            def make(text, url=url, suffix=suffix):
+                headline = escape(text)
                 link = f"<link href='{url}' color='{INK}'><u>{headline}</u></link>" if url else headline
-                source = escape(article.get("source") or "")
-                story.append(
-                    Paragraph(
-                        f"{link} <font size='7.5' color='{MUTED}'>{('— ' + source) if source else ''}</font>",
-                        ParagraphStyle("news", parent=s["bullet"], fontSize=9),
-                        bulletText="•",
-                    )
-                )
+                return Paragraph(link + suffix, style, bulletText="•")
+
+            story.append(
+                _fit_lines(make, article.get("headline") or "Untitled", CONTENT_W, HEADLINE_MAX_LINES)
+            )
         return story
 
     # ------------------------------------------------------------------ #
-    # Last page: what each short-interest / options / runway level means
+    # Last page: how alerts work, and what each positioning level means
     # ------------------------------------------------------------------ #
-    def _positioning_page(self):
+    def _guide_page(self, ctx):
         s = self.s
+        t = ctx["thresholds"]
+        how_alerts_work = (
+            f"A pre-market gap of ±{t.get('premarket_gap_pct', 3.0):g}% or a last-session move of "
+            f"±{t.get('price_change_pct', 5.0):g}% (when it's at least a normal-sized move for that stock), "
+            f"or any move of {t.get('unusual_move_sigma', 2.0):g}x the stock's typical daily move; volume at "
+            f"{t.get('volume_surge_multiplier', 2.0):g}x its 20-day average; RSI outside "
+            f"{t.get('rsi_oversold', 30)}–{t.get('rsi_overbought', 70)}; a close through the 50- or 200-day "
+            f"average; a 52-week high or low; earnings within {t.get('earnings_lookahead_days', 7)} days. "
+            f"Data: Finnhub and Yahoo Finance."
+        )
         story = [
+            Paragraph("How alerts work", s["h2"]),
+            Paragraph(escape(how_alerts_work), s["body"]),
             Paragraph("Reading short interest, options and cash runway", s["h2"]),
             Paragraph(escape(self.formatter.positioning_note()), s["body"]),
         ]
@@ -535,4 +812,6 @@ class NewsletterPDF:
                 )
             )
             story.append(KeepTogether([Paragraph(escape(title), s["h3"]), table]))
+        if _height(story) > FRAME_H:
+            print("    [WARN] PDF: the guide page is taller than one page and will spill.")
         return story

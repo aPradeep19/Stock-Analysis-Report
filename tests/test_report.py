@@ -11,19 +11,45 @@ import pandas as pd
 from src.analyzer import QuantitativeAnalyzer
 from src.dispatcher import EmailDispatcher, parse_recipients
 from src.formatter import ReportFormatter, _most_common_session, fmt_market_cap, fmt_pct, fmt_volume
-from tests.fixtures import sample_earnings, sample_market, sample_movers, sample_pipeline
+from tests.fixtures import (
+    sample_earnings,
+    sample_market,
+    sample_movers,
+    sample_pipeline,
+    stress_context,
+    stress_earnings,
+    stress_pipeline,
+)
 from tests.test_analyzer import THRESHOLDS
 
 
-def build_report():
+def build_report(pipeline=None, earnings=None, explanations=None, extras=False):
+    """
+    The sample (or given) watchlist run through analyzer and formatter. `extras` adds every
+    optional line at full length: a 'why' per ranked stock and a busy economic calendar.
+    """
     analyzer = QuantitativeAnalyzer(THRESHOLDS)
-    pipeline = sample_pipeline()
+    pipeline = pipeline if pipeline is not None else sample_pipeline()
+    earnings = sample_earnings() if earnings is None else earnings
     market = analyzer.analyze_market(sample_market())
-    results = analyzer.analyze(pipeline, market, sample_earnings())
+    results = analyzer.analyze(pipeline, market, earnings)
     ranked = analyzer.rank_stocks(results)
     formatter = ReportFormatter({"title": "Pre-Market Brief"}, THRESHOLDS)
     when = pd.Timestamp("2026-10-01 07:53", tz="America/New_York").to_pydatetime()
-    return formatter, formatter.build_context(results, ranked, market, sample_movers(), when), pipeline
+    calendar = []
+    if extras:
+        explanations, calendar = stress_context(ranked)
+    ctx = formatter.build_context(
+        results,
+        ranked,
+        market,
+        sample_movers(),
+        when,
+        economic_calendar=calendar,
+        earnings=earnings,
+        explanations=explanations,
+    )
+    return formatter, ctx, pipeline
 
 
 class FormatterTests(unittest.TestCase):
@@ -92,22 +118,114 @@ class FormatterTests(unittest.TestCase):
         self.assertEqual(fmt_market_cap(2_100_000), "$2.1T")
 
 
+def render_pdf(formatter, ctx, pipeline, tmp):
+    """
+    Builds the PDF and returns (page texts, {page index: [24pt heading text]}).
+
+    Stock pages are found by their 24pt ticker heading, the only text set that large: plain text
+    matching would also hit the ticker's row in the watchlist table.
+    """
+    from pypdf import PdfReader
+
+    from src.pdf_report import NewsletterPDF
+
+    path = NewsletterPDF(formatter).build(ctx, pipeline, os.path.join(tmp, "report.pdf"))
+    texts, headings = [], {}
+    for i, page in enumerate(PdfReader(path).pages):
+
+        def visit(text, cm, tm, font, size, i=i):
+            if size * tm[0] >= 23.5 and text.strip():
+                headings.setdefault(i, []).append(text.strip())
+
+        texts.append(page.extract_text(visitor_text=visit))
+    return texts, headings
+
+
 class PdfTests(unittest.TestCase):
-    def test_pdf_has_header_page_stock_pages_and_guide_page(self):
-        from pypdf import PdfReader
-
-        from src.pdf_report import NewsletterPDF
-
-        formatter, ctx, pipeline = build_report()
+    def assert_structure(self, formatter, ctx, pipeline):
         with tempfile.TemporaryDirectory() as tmp:
-            path = NewsletterPDF(formatter).build(ctx, pipeline, os.path.join(tmp, "report.pdf"))
-            reader = PdfReader(path)
-            self.assertGreaterEqual(len(reader.pages), 2 + len(ctx["stocks"]))
-            first_page = reader.pages[0].extract_text()
-            self.assertIn("Big & concerning moves", first_page)
-            self.assertNotIn("Reading short interest, options and cash runway", first_page)
-            self.assertIn(ctx["stocks"][-1]["symbol"], reader.pages[-2].extract_text())
-            self.assertIn("Reading short interest, options and cash runway", reader.pages[-1].extract_text())
+            texts, headings = render_pdf(formatter, ctx, pipeline, tmp)
+        symbols = [s["symbol"] for s in ctx["stocks"]]
+
+        # Each stock's ticker heading is on exactly one page, in report order, one stock per page.
+        pages_by_symbol = {sym: [i for i, h in headings.items() if sym in h] for sym in symbols}
+        for sym, pages in pages_by_symbol.items():
+            self.assertEqual(len(pages), 1, f"{sym} heading on pages {pages}")
+        stock_pages = [pages_by_symbol[sym][0] for sym in symbols]
+        header_pages = stock_pages[0]
+        self.assertEqual(stock_pages, list(range(header_pages, header_pages + len(symbols))))
+
+        self.assertLessEqual(header_pages, 2)
+        self.assertEqual(len(texts), header_pages + len(symbols) + 1)
+
+        self.assertIn("Big & concerning moves", texts[0])
+        header_text = " ".join(texts[:header_pages])
+        for item in ctx["ranked"]:  # collapsed if need be, but never dropped
+            self.assertIn(item["symbol"], header_text)
+        self.assertIn("Watchlist at a glance", header_text)
+        self.assertNotIn("How alerts work", header_text)
+        self.assertIn("How alerts work", texts[-1])
+        self.assertIn("Reading short interest, options and cash runway", texts[-1])
+        return texts, stock_pages
+
+    def test_pdf_structure_on_sample(self):
+        formatter, ctx, pipeline = build_report()
+        texts, _ = self.assert_structure(formatter, ctx, pipeline)
+        self.assertNotIn("Watchlist at a glance", texts[0])  # page 1 stays the front page
+
+    def test_pdf_structure_on_full_watchlist_stress_case(self):
+        pipeline = stress_pipeline()
+        formatter, ctx, _ = build_report(pipeline, stress_earnings())
+        self.assertEqual(len(ctx["stocks"]), 11)
+        self.assertGreaterEqual(len(ctx["ranked"]), 9)
+        self.assert_structure(formatter, ctx, pipeline)
+
+    def test_pdf_structure_with_every_extra_line(self):
+        """'Why' lines, economic releases, earnings this week and the 10-yr tile, all at once."""
+        for name, pipeline, earnings in (
+            ("sample", sample_pipeline(), None),
+            ("stress", stress_pipeline(), stress_earnings()),
+        ):
+            with self.subTest(name):
+                formatter, ctx, _ = build_report(pipeline, earnings, extras=True)
+                self.assertTrue(all(item["why"] for item in ctx["ranked"]))
+                self.assertEqual(len(ctx["economic_events"]), 5)
+                texts, stock_pages = self.assert_structure(formatter, ctx, pipeline)
+                self.assertIn("10-yr Treasury", texts[0])
+                self.assertIn("Today (Central):", texts[0])
+                self.assertIn("Why:", texts[0])
+                self.assertIn("What's moving it", texts[stock_pages[0]])
+
+    def test_stock_page_skips_signals_repeated_in_key_metrics(self):
+        formatter, ctx, pipeline = build_report()
+        texts, stock_pages = self.assert_structure(formatter, ctx, pipeline)
+        page = texts[stock_pages[0]]
+        self.assertIn("Institutional ownership", page)  # the metric row stays
+        self.assertNotIn("Institutions hold", page)  # its signal twin doesn't
+        self.assertNotIn("Open interest, next 30 days", page)
+        self.assertIn("day average", page)  # moving-average signals add information, so they stay
+
+    def test_signals_are_trimmed_least_useful_first(self):
+        from src.pdf_report import _signal_trims
+
+        signals = [("rsi", "r"), ("sma_20", "a20"), ("sma_50", "a50"), (None, "untagged"), ("sma_20", "b20")]
+        trims = [[text for _, text in shown] for shown in _signal_trims(signals)]
+        self.assertEqual(trims[0], ["r", "a20", "a50", "untagged", "b20"])
+        self.assertEqual(trims[1], ["r", "a50", "untagged", "b20"])  # 20-day averages go first
+        self.assertEqual(trims[3], ["a50", "untagged"])  # then RSI
+        self.assertEqual(trims[-2], ["untagged"])  # untagged signals are kept longest
+        self.assertEqual(trims[-1], [])
+
+    def test_headlines_are_cut_to_two_lines(self):
+        from src.pdf_report import CONTENT_W, HEADLINE_MAX_LINES, NewsletterPDF, _line_count
+
+        pipeline = stress_pipeline()
+        formatter, ctx, _ = build_report(pipeline, stress_earnings())
+        lines = NewsletterPDF(formatter)._headlines(ctx["stocks"][0], ctx)[1:]
+        self.assertEqual(len(lines), 3)
+        for paragraph in lines:
+            self.assertLessEqual(_line_count(paragraph, CONTENT_W), HEADLINE_MAX_LINES)
+            self.assertIn("…", paragraph.text)
 
     def test_preview_shows_first_page_only(self):
         from PIL import Image
@@ -218,6 +336,90 @@ class SessionLabelTests(unittest.TestCase):
         self.assertEqual(_most_common_session(["regular", "pre-market"]), "regular")
         self.assertEqual(_most_common_session(["after-hours", "regular", "regular"]), "regular")
         self.assertEqual(_most_common_session([]), "pre-market")
+
+
+class WhyLineTests(unittest.TestCase):
+    """Model output is outside text: it must be escaped exactly like a headline."""
+
+    HOSTILE = "Shares <b>jumped</b> after Q3 beat & guidance <script>x</script>"
+
+    def build(self):
+        symbol = build_report()[1]["ranked"][0]["symbol"]
+        why = {symbol: {"text": self.HOSTILE, "source": "Wire <i>", "url": "https://example.com"}}
+        return build_report(explanations=why)
+
+    def test_html_escapes_model_output(self):
+        formatter, ctx, _ = self.build()
+        html = formatter.render_html(ctx)
+        self.assertIn("Shares &lt;b&gt;jumped&lt;/b&gt; after Q3 beat &amp; guidance &lt;script&gt;", html)
+        self.assertIn("Wire &lt;i&gt;", html)
+        self.assertNotIn("<script>", html)
+        self.assertNotIn("<b>jumped</b>", html)
+
+    def test_text_version_shows_it_verbatim(self):
+        formatter, ctx, _ = self.build()
+        self.assertIn(f"Why: {self.HOSTILE} — Wire <i>", formatter.render_text(ctx))
+
+    def test_pdf_shows_markup_as_text(self):
+        formatter, ctx, pipeline = self.build()
+        with tempfile.TemporaryDirectory() as tmp:
+            texts, _ = render_pdf(formatter, ctx, pipeline, tmp)
+        self.assertIn("<b>jumped</b>", " ".join(texts[0].split()))  # shown literally, not as bold
+
+    def test_no_explanations_means_no_lines(self):
+        formatter, ctx, _ = build_report()
+        self.assertNotIn("Why:", formatter.render_html(ctx))
+        self.assertNotIn("Why:", formatter.render_text(ctx))
+
+
+class MarketContextTests(unittest.TestCase):
+    def test_ten_year_yield_in_either_yahoo_scale(self):
+        from src.analyzer import _yield_pct
+
+        self.assertAlmostEqual(_yield_pct(4.918), 4.918)
+        self.assertAlmostEqual(_yield_pct(49.18), 4.918)
+
+    def test_ten_year_tile_in_basis_points(self):
+        formatter, ctx, _ = build_report()
+        tnx = ctx["market"]["^TNX"]
+        self.assertTrue(3 < tnx["yield_pct"] < 6)
+        self.assertIn(" bp last session", formatter.render_html(ctx))
+        self.assertIn("10-yr ", formatter.render_text(ctx))
+
+    def test_only_todays_releases_in_time_order(self):
+        from datetime import date
+
+        from src.formatter import todays_releases
+
+        entries = [
+            {"date": "2026-10-01", "time": "13:00", "event": "FOMC decision"},
+            {"date": date(2026, 10, 1), "time": "07:30", "event": "CPI (Sep)"},  # YAML parses dates
+            {"date": "2026-10-02", "time": "07:30", "event": "Jobs report"},
+            {"date": "2026-10-01", "time": "7.30am", "event": "Bad time"},
+            {"time": "08:00", "event": "No date"},
+        ]
+        with mock.patch("builtins.print"):
+            releases = todays_releases(entries, date(2026, 10, 1))
+        self.assertEqual(
+            releases,
+            [{"time": "7:30 AM", "event": "CPI (Sep)"}, {"time": "1:00 PM", "event": "FOMC decision"}],
+        )
+
+    def test_earnings_this_week_runs_through_friday(self):
+        from datetime import date
+
+        from src.formatter import earnings_this_week
+
+        earnings = {
+            "AAA": {"date": "2026-10-02", "hour": "amc"},  # Friday
+            "BBB": {"date": "2026-10-01", "hour": "bmo"},  # today
+            "CCC": {"date": "2026-10-05", "hour": "bmo"},  # next Monday: excluded
+            "DDD": {"date": "2026-09-30", "hour": "amc"},  # yesterday: excluded
+        }
+        labels = [e["label"] for e in earnings_this_week(earnings, date(2026, 10, 1))]
+        self.assertEqual(labels, ["BBB today before open", "AAA Fri after close"])
+        # Run on a Saturday, "this week" means the coming one.
+        self.assertEqual([e["symbol"] for e in earnings_this_week(earnings, date(2026, 10, 3))], ["CCC"])
 
 
 class HeadlineDateTests(unittest.TestCase):

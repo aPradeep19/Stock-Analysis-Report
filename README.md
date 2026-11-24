@@ -20,12 +20,15 @@ The watchlist and alert thresholds live in `config.yaml`.
 pip install -r requirements.txt
 ```
 
-You'll need four environment variables (or GitHub secrets):
+You'll need four environment variables (or GitHub secrets), plus one optional one:
 
 - `FINNHUB_API_KEY`: free key from [finnhub.io](https://finnhub.io)
 - `SENDER_EMAIL`: the Gmail account that sends the email
 - `EMAIL_PASSWORD`: a Gmail [App Password](https://myaccount.google.com/apppasswords), not your normal password
 - `RECIPIENT_EMAILS`: comma-separated list of who gets it (everyone is BCC'd)
+- `ANTHROPIC_API_KEY` (optional): key from [console.anthropic.com](https://console.anthropic.com). Adds a two-sentence "why it's moving" line to each flagged stock, written from its recent headlines. Without it the report goes out without those lines.
+
+For local runs, make a `.env` and fill it in; `main.py` reads it on start-up. `.env` is gitignored, and real environment variables (including GitHub secrets) take priority over it.
 
 ## Running it
 
@@ -38,7 +41,7 @@ It skips weekends and holidays on its own. Use `--force` to send anyway.
 
 ## Scheduling
 
-The workflow in `.github/workflows/premarket_report.yml` sends the email at 7 AM Central, Monday to Friday. Add the four variables above as repo secrets. You can also start it by hand from the Actions tab.
+The workflow in `.github/workflows/premarket_report.yml` sends the email at 7 AM Central, Monday to Friday. Add the variables above as repo secrets (`ANTHROPIC_API_KEY` too, if you want the "why it's moving" lines). You can also start it by hand from the Actions tab.
 
 GitHub's own cron is often hours late, so the workflow is meant to be started by an outside scheduler at 7:00 AM:
 

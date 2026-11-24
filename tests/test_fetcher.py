@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
 import pandas as pd
 
 from src.fetcher import MARKET_TZ, FinnhubFetcher
@@ -102,6 +103,84 @@ class OptionsInterestTests(unittest.TestCase):
     def test_no_listed_options(self):
         with mock.patch("src.fetcher.yf.Ticker", return_value=mock.Mock(options=())):
             self.assertEqual(FinnhubFetcher("key").get_options_interest("X"), {})
+
+
+class BlankDailyBarTests(unittest.TestCase):
+    """Yahoo sometimes serves today's daily row after the close with volume but no prices."""
+
+    def ticker(self, minute_bars):
+        index = pd.DatetimeIndex(["2026-11-19", "2026-11-20", "2026-11-23"]).tz_localize(MARKET_TZ)
+        daily = pd.DataFrame(
+            {
+                "Open": [152.9, 143.5, float("nan")],
+                "High": [155.0, 146.0, float("nan")],
+                "Low": [150.0, 124.0, float("nan")],
+                "Close": [145.98, 125.53, float("nan")],
+                "Volume": [322_940_100, 626_373_200, 776_225_888],
+            },
+            index=index,
+        )
+
+        class FakeTicker:
+            minute_calls = 0
+
+            def history(self, **kwargs):
+                if kwargs.get("interval") == "1m":
+                    FakeTicker.minute_calls += 1
+                    return minute_bars
+                return daily
+
+        return FakeTicker
+
+    @staticmethod
+    def minutes():
+        times = pd.date_range("2026-11-23 09:30", "2026-11-23 15:59", freq="min", tz=MARKET_TZ)
+        closes = np.linspace(130.0, 165.18, len(times))
+        bars = pd.DataFrame(
+            {
+                "Open": closes - 0.1,
+                "High": closes + 0.5,
+                "Low": closes - 0.5,
+                "Close": closes,
+                "Volume": 1000,
+            },
+            index=times,
+        )
+        bars.iloc[0, bars.columns.get_loc("Open")] = 128.0
+        return bars
+
+    def candles_at(self, hour, minute_bars):
+        fake = self.ticker(minute_bars)
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 11, 23, hour, 0, tzinfo=MARKET_TZ)
+
+        with (
+            mock.patch("src.fetcher.yf.Ticker", return_value=fake()),
+            mock.patch("src.fetcher.datetime", Clock),
+            mock.patch("builtins.print"),
+        ):
+            return FinnhubFetcher("key").get_historical_candles("NVDA", 10), fake
+
+    def test_after_the_close_todays_bar_is_rebuilt_from_minute_bars(self):
+        candles, _ = self.candles_at(20, self.minutes())
+        last = candles.iloc[-1]
+        self.assertEqual(candles.index[-1].date().isoformat(), "2026-11-23")
+        self.assertAlmostEqual(last["close"], 165.18)
+        self.assertEqual(last["open"], 128.0)
+        self.assertEqual(last["volume"], 776_225_888)  # Yahoo's daily volume, not the minute sum
+        self.assertAlmostEqual((last["close"] / candles["close"].iloc[-2] - 1) * 100, 31.6, places=1)
+
+    def test_before_the_close_the_blank_row_is_just_dropped(self):
+        candles, fake = self.candles_at(14, self.minutes())
+        self.assertEqual(candles.index[-1].date().isoformat(), "2026-11-20")
+        self.assertEqual(fake.minute_calls, 0)  # no extra request while the session is still open
+
+    def test_no_minute_bars_falls_back_to_dropping_the_row(self):
+        candles, _ = self.candles_at(20, pd.DataFrame())
+        self.assertEqual(candles.index[-1].date().isoformat(), "2026-11-20")
 
 
 if __name__ == "__main__":
