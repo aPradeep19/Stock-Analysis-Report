@@ -19,6 +19,7 @@ from tests.fixtures import (
     stress_context,
     stress_earnings,
     stress_pipeline,
+    stress_scorecard,
 )
 from tests.test_analyzer import THRESHOLDS
 
@@ -36,9 +37,10 @@ def build_report(pipeline=None, earnings=None, explanations=None, extras=False):
     ranked = analyzer.rank_stocks(results)
     formatter = ReportFormatter({"title": "Pre-Market Brief"}, THRESHOLDS)
     when = pd.Timestamp("2026-10-01 07:53", tz="America/New_York").to_pydatetime()
-    calendar = []
+    calendar, card = [], None
     if extras:
         explanations, calendar = stress_context(ranked)
+        card = stress_scorecard(ranked)
     ctx = formatter.build_context(
         results,
         ranked,
@@ -48,6 +50,7 @@ def build_report(pipeline=None, earnings=None, explanations=None, extras=False):
         economic_calendar=calendar,
         earnings=earnings,
         explanations=explanations,
+        scorecard=card,
     )
     return formatter, ctx, pipeline
 
@@ -194,6 +197,8 @@ class PdfTests(unittest.TestCase):
                 self.assertIn("10-yr Treasury", texts[0])
                 self.assertIn("Today (Central):", texts[0])
                 self.assertIn("Why:", texts[0])
+                self.assertIn("Yesterday's scorecard", texts[1])  # header page 2
+                self.assertIn("directional alerts held", texts[1])
                 self.assertIn("What's moving it", texts[stock_pages[0]])
 
     def test_stock_page_skips_signals_repeated_in_key_metrics(self):
@@ -336,6 +341,86 @@ class SessionLabelTests(unittest.TestCase):
         self.assertEqual(_most_common_session(["regular", "pre-market"]), "regular")
         self.assertEqual(_most_common_session(["after-hours", "regular", "regular"]), "regular")
         self.assertEqual(_most_common_session([]), "pre-market")
+
+
+def internal_links(path):
+    """{page index: [target page index, ...]} for every in-document link, in drawing order."""
+    from pypdf import PdfReader
+
+    reader = PdfReader(path)
+    page_of = {page.indirect_reference.idnum: i for i, page in enumerate(reader.pages)}
+    links = {}
+    for i, page in enumerate(reader.pages):
+        for annot in page.get("/Annots") or []:
+            annot = annot.get_object()
+            dest = annot.get("/Dest") or (annot.get("/A") or {}).get("/D")
+            if annot.get("/Subtype") == "/Link" and dest is not None and not isinstance(dest, str):
+                links.setdefault(i, []).append(page_of[dest[0].idnum])
+    return links
+
+
+class JumpLinkTests(unittest.TestCase):
+    def test_pdf_tickers_jump_to_their_pages_and_back(self):
+        from src.pdf_report import NewsletterPDF
+
+        for name, pipeline, earnings in (
+            ("sample", sample_pipeline(), None),
+            ("stress", stress_pipeline(), stress_earnings()),
+        ):
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                formatter, ctx, _ = build_report(pipeline, earnings, extras=True)
+                path = NewsletterPDF(formatter).build(ctx, pipeline, os.path.join(tmp, "r.pdf"))
+                texts, headings = render_pdf(formatter, ctx, pipeline, tmp)
+                page_of = {h[0]: i for i, h in headings.items()}
+                links = internal_links(path)
+
+                # Page 2's watchlist table: one link per stock, to that stock's page, in table order.
+                self.assertEqual(links[1], [page_of[s["symbol"]] for s in ctx["stocks"]])
+                # Page 1: every flagged stock links to its page, in rank order.
+                self.assertEqual(links[0], [page_of[item["symbol"]] for item in ctx["ranked"]])
+                # Every stock page links back to the watchlist on page 2.
+                for symbol in (s["symbol"] for s in ctx["stocks"]):
+                    self.assertEqual(links[page_of[symbol]], [1], symbol)
+
+    def test_email_tickers_jump_to_their_sections_and_back(self):
+        formatter, ctx, _ = build_report()
+        html = formatter.render_html(ctx)
+        self.assertIn("id='watchlist'", html)
+        for stock in ctx["stocks"]:
+            anchor = f"stock-{stock['symbol']}"
+            self.assertIn(f"id='{anchor}'", html)
+            self.assertGreaterEqual(html.count(f"href='#{anchor}'"), 1)  # watchlist table
+        for item in ctx["ranked"]:
+            self.assertEqual(html.count(f"href='#stock-{item['symbol']}'"), 2)  # table + flagged list
+        self.assertEqual(html.count("href='#watchlist'"), len(ctx["stocks"]))
+
+    def test_anchor_names_are_safe(self):
+        from src.formatter import anchor_id
+
+        self.assertEqual(anchor_id("BRK.B"), "stock-BRK-B")
+        self.assertEqual(anchor_id("^VIX"), "stock--VIX")
+
+
+class ScorecardRenderTests(unittest.TestCase):
+    def test_no_history_message_everywhere(self):
+        formatter, ctx, pipeline = build_report()
+        self.assertIn("No prior alerts to score.", formatter.render_html(ctx))
+        self.assertIn("No prior alerts to score.", formatter.render_text(ctx))
+        with tempfile.TemporaryDirectory() as tmp:
+            texts, _ = render_pdf(formatter, ctx, pipeline, tmp)
+        self.assertIn("No prior alerts to score.", texts[1])
+
+    def test_full_scorecard_in_email_and_text(self):
+        formatter, ctx, _ = build_report(extras=True)
+        html, text = formatter.render_html(ctx), formatter.render_text(ctx)
+        earnings = "AAA earnings (after Tue's close): moved +8.1% vs. a typical 2.4% (3.4x)"
+        self.assertIn(earnings, text)
+        self.assertIn(earnings.replace("'", "&#x27;"), html)  # escaped like all outside text
+        for rendered in (html, text):
+            self.assertIn("directional alerts held; avg follow-through +0.6% (+0.2% vs. Nasdaq)", rendered)
+            self.assertIn("Hit rates over 23 report days", rendered)
+            self.assertIn("Held: the session closed on the flagged side of the prior close.", rendered)
+        self.assertIn("vs. Nasdaq</th>", html)
 
 
 class WhyLineTests(unittest.TestCase):

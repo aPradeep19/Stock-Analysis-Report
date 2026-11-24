@@ -6,3 +6,5 @@ __pycache__/
 output/
 .env
 sample*
+# Alert history fetched from the history branch
+history/

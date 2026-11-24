@@ -3,7 +3,7 @@ The PDF newsletter.
 
 Layout, fixed so readers always know where to look:
   page 1     front page: title, market backdrop, big & concerning moves (also the README preview)
-  page 2     watchlist at a glance, market movers (and room for future sections)
+  page 2     watchlist at a glance, yesterday's scorecard, market movers
   one page per stock: chart, key metrics, alerts and signals, headlines
   last page  how alerts work, and what each positioning level means
 
@@ -40,14 +40,18 @@ from reportlab.platypus import (
     TableStyle,
 )
 
+from src import scorecard as scorecard_text
 from src.charts import price_volume_chart
 from src.formatter import (
     DOWN_TEXT,
     HAIRLINE,
     INK,
     INK_2,
+    LINK,
     MUTED,
     UP_TEXT,
+    WATCHLIST_ANCHOR,
+    anchor_id,
     fmt_bp,
     fmt_money,
     fmt_num,
@@ -126,6 +130,16 @@ def _styles():
         "small": ParagraphStyle(
             "small", **{**base, "fontSize": 8, "leading": 10.5, "textColor": colors.HexColor(INK_2)}
         ),
+        "small_r": ParagraphStyle(
+            "small_r",
+            **{
+                **base,
+                "fontSize": 8,
+                "leading": 10.5,
+                "textColor": colors.HexColor(INK_2),
+                "alignment": TA_RIGHT,
+            },
+        ),
         "cell": ParagraphStyle("cell", **{**base, "fontSize": 8.5, "leading": 11}),
         "cell_r": ParagraphStyle("cell_r", **{**base, "fontSize": 8.5, "leading": 11, "alignment": TA_RIGHT}),
         "ticker": ParagraphStyle(
@@ -147,6 +161,11 @@ def _styles():
         # Hanging indent for lines that carry their own colored bullet in the text.
         "hang": ParagraphStyle("hang", **{**base, "leftIndent": 10, "firstLineIndent": -10, "spaceAfter": 2}),
     }
+
+
+def _ticker_link(symbol):
+    """Bold ticker that jumps to the stock's own page (an internal PDF link)."""
+    return f'<a href="#{anchor_id(symbol)}" color="{LINK}"><b>{escape(symbol)}</b></a>'
 
 
 def _pct_markup(value, decimals=1, bold=True):
@@ -183,15 +202,18 @@ def _fit_sections(sections, budget=FRAME_H):
     Lays sections out top to bottom within `budget` points.
 
     Each section is a list of versions (each a list of flowables), richest first. A section gets
-    the richest version that fits the space left after the sections above it, so new sections
-    only need to describe their versions; nothing here counts rows by hand.
+    the richest version that fits the space left after the sections above it, minus the room
+    the sections below need at their most compact, so an early section can't crowd out a later
+    one. New sections only need to describe their versions; nothing here counts rows by hand.
     """
+    smallest = [_height(versions[-1]) for _, versions in sections]
     story = []
     remaining = budget
-    for name, versions in sections:
+    for i, (name, versions) in enumerate(sections):
+        reserved = sum(smallest[i + 1 :])
         for version in versions:
             height = _height(version)
-            if height <= remaining:
+            if height <= remaining - reserved:
                 break
         else:
             print(f"    [WARN] PDF: '{name}' doesn't fit its page even at its most compact; it will spill.")
@@ -465,7 +487,7 @@ class NewsletterPDF:
             [
                 [
                     Paragraph(
-                        f"<b>{escape(item['symbol'])}</b>{name}  "
+                        f"{_ticker_link(item['symbol'])}{name}  "
                         f"<font size='7.5' color='{tone['color']}'><b>{tone['label']}</b></font>",
                         s["body"],
                     ),
@@ -489,7 +511,7 @@ class NewsletterPDF:
         gap = item.get("gap_pct")
         gap_text = f"{_pct_markup(gap)} {ctx['labels']['short']}  ·  " if gap is not None else ""
         prefix = (
-            f"<b>{escape(item['symbol'])}</b>  "
+            f"{_ticker_link(item['symbol'])}  "
             f"<font size='7.5' color='{tone['color']}'><b>{tone['label']}</b></font>  {gap_text}"
         )
         line = _fit_lines(
@@ -502,16 +524,83 @@ class NewsletterPDF:
         return self._ranked_frame([line, why] if why else line, tone, top=3, bottom=3)
 
     # ------------------------------------------------------------------ #
-    # Page 2: the whole watchlist and the wider market
+    # Page 2: the whole watchlist, yesterday's scorecard and the wider market
     # ------------------------------------------------------------------ #
     def _overview_page(self, ctx):
-        # A future section (e.g. a scorecard) slots in here as another (name, versions) pair.
+        # Sections fill the page in this order; each falls back to a more compact version when
+        # the ones above leave too little room. New sections slot in as (name, versions) pairs.
         return _fit_sections(
             [
                 ("watchlist at a glance", [self._watchlist(ctx)]),
+                ("yesterday's scorecard", self._scorecard_versions(ctx)),
                 ("outside your watchlist", self._movers_versions(ctx)),
             ]
         )
+
+    def _pdf_table(self, header, rows, widths, left_columns=1):
+        """A plain data table in the report's style; `widths` are relative and fill the page."""
+        s = self.s
+        scale = CONTENT_W / sum(widths)
+
+        def cell(text, i, bold=False):
+            style = s["cell"] if i < left_columns else s["cell_r"]
+            return Paragraph(f"<b>{escape(text)}</b>" if bold else escape(text), style)
+
+        data = [[cell(h, i, bold=True) for i, h in enumerate(header)]]
+        data += [[cell(c, i) for i, c in enumerate(row)] for row in rows]
+        table = Table(data, colWidths=[w * scale for w in widths], repeatRows=1)
+        table.setStyle(
+            TableStyle(
+                [
+                    ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor(HAIRLINE)),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                ]
+            )
+        )
+        return table
+
+    def _scorecard_versions(self, ctx):
+        """
+        Yesterday's scorecard, richest first: every scored alert plus hit rates, then fewer
+        rows (the most severe alerts are kept), then without hit rates, then the summary alone.
+        """
+        s = self.s
+        card = ctx["scorecard"]
+        heading = Paragraph("Yesterday's scorecard", s["h2"])
+        summary = Paragraph(escape(scorecard_text.summary_line(card)), s["body"])
+        if card.get("status") != "ok":
+            return [[heading, summary]]
+
+        footnote = Paragraph(escape(scorecard_text.footnote(card)), s["small"])
+        earnings = [
+            Paragraph(escape(scorecard_text.earnings_line(item)), s["cell"]) for item in card["earnings"]
+        ]
+        header, rows = self.formatter.scorecard_table(card)
+        hit_rates = []
+        if card["hit_rates"]:
+            hit_header, hit_rows = self.formatter.hit_rate_table(card)
+            hit_rates = [
+                Paragraph(f"Hit rates over {card['days_logged']} report days", s["h3"]),
+                self._pdf_table(hit_header, hit_rows, [1.6, 0.7, 0.7, 1.3, 1.3]),
+            ]
+
+        def version(row_count, with_hit_rates):
+            parts = [heading, summary]
+            if rows and row_count:
+                parts += [
+                    Spacer(1, 4),
+                    self._pdf_table(header, rows[:row_count], [0.8, 1.8, 1.0, 1.0, 0.6, 1.2, 1.1], 2),
+                ]
+                if row_count < len(rows):
+                    parts.append(Paragraph(f"…and {len(rows) - row_count} more", s["small"]))
+            parts += earnings + (hit_rates if with_hit_rates else []) + [Spacer(1, 4), footnote]
+            return parts
+
+        versions = [version(n, True) for n in range(len(rows), min(len(rows), 3) - 1, -1)]
+        versions += [version(min(len(rows), 3), False), [heading, summary]]
+        return versions
 
     def _watchlist(self, ctx):
         s = self.s
@@ -533,7 +622,7 @@ class NewsletterPDF:
             m = stock["metrics"]
             rows.append(
                 [
-                    Paragraph(f"<b>{escape(stock['symbol'])}</b>", s["cell"]),
+                    Paragraph(_ticker_link(stock["symbol"]), s["cell"]),
                     Paragraph(fmt_money(m.get("premarket_price")), s["cell_r"]),
                     Paragraph(_pct_markup(m.get("gap_pct")), s["cell_r"]),
                     Paragraph(fmt_money(m.get("last_close")), s["cell_r"]),
@@ -565,7 +654,8 @@ class NewsletterPDF:
         for r in range(len(ctx["stocks"]) + 1, len(rows)):
             style.append(("SPAN", (1, r), (-1, r)))
         table.setStyle(TableStyle(style))
-        return [Paragraph("Watchlist at a glance", s["h2"]), table]
+        # Named anchor: every stock page's "Back to watchlist" link lands here.
+        return [Paragraph(f'<a name="{WATCHLIST_ANCHOR}"/>Watchlist at a glance', s["h2"]), table]
 
     def _movers_versions(self, ctx):
         """Market movers with every row, then one fewer row per screen, down to one."""
@@ -661,7 +751,10 @@ class NewsletterPDF:
             [
                 [
                     [
-                        Paragraph(escape(stock["symbol"]), s["ticker"]),
+                        # Named anchor: the ticker links on pages 1 and 2 jump here.
+                        Paragraph(
+                            f'<a name="{anchor_id(stock["symbol"])}"/>{escape(stock["symbol"])}', s["ticker"]
+                        ),
                         Paragraph(name_bits or "&nbsp;", s["sub"]),
                     ],
                     [
@@ -671,6 +764,10 @@ class NewsletterPDF:
                             if gap is not None
                             else "last close",
                             s["cell_r"],
+                        ),
+                        Paragraph(
+                            f'<a href="#{WATCHLIST_ANCHOR}" color="{LINK}">Back to watchlist</a>',
+                            s["small_r"],
                         ),
                     ],
                 ]

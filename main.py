@@ -27,9 +27,12 @@ from src.dispatcher import EmailDispatcher, parse_recipients
 from src.explainer import explain_moves
 from src.fetcher import MARKET_TZ, REGULAR_CLOSE, FinnhubFetcher, merge_news
 from src.formatter import ReportFormatter, fmt_pct
+from src.scorecard import alert_rows, build_scorecard, load_history, summary_line, write_pending
 from src.sectors import CANDIDATE_FUNDS, MARKET_PROXY, assign_sectors, sector_context
 
 OUTPUT_DIR = "output"
+HISTORY_FILE = os.path.join("history", "alerts.jsonl")  # fetched from the history branch by the workflow
+PENDING_FILE = os.path.join(OUTPUT_DIR, "alerts_pending.jsonl")  # today's rows, appended after a send
 MARKET_SYMBOLS = ["SPY", "QQQ"]  # benchmarks that also get a pre-market gap
 VIX_SYMBOL = "^VIX"  # daily close only; it doesn't trade pre-market
 TNX_SYMBOL = "^TNX"  # 10-year Treasury yield; daily close only, like the VIX
@@ -229,12 +232,13 @@ def main():
             options_days=thresholds.get("options_window_days", 30),
         )
 
+    # A year-plus of benchmark history, so the scorecard can score every logged report day.
     print("--> Fetching market backdrop (SPY, QQQ, VIX)")
     market_raw = {}
     for symbol in MARKET_SYMBOLS:
         market_raw[symbol] = {
             "candles": safe_call(
-                f"{symbol} history", lambda s=symbol: fetcher.get_historical_candles(s, 60), pd.DataFrame()
+                f"{symbol} history", lambda s=symbol: fetcher.get_historical_candles(s, 400), pd.DataFrame()
             ),
             "premarket": safe_call(
                 f"{symbol} pre-market", lambda s=symbol: fetcher.get_premarket_snapshot(s), {}
@@ -297,6 +301,19 @@ def main():
         if "error" in result:
             print(f"     [{symbol}] skipped: {result['error']}")
 
+    # Yesterday's scorecard. The workflow fetches the history file before this runs; on the first
+    # run (or a local run) there isn't one, and the section says so.
+    history_path = config.get("scorecard", {}).get("history_file", HISTORY_FILE)
+    history, history_status = safe_call("alert history", lambda: load_history(history_path), ([], "error"))
+    scoring_candles = {symbol: data.get("candles") for symbol, data in pipeline_data.items()}
+    scoring_candles.update({symbol: market_raw[symbol]["candles"] for symbol in MARKET_SYMBOLS})
+    scorecard = safe_call(
+        "scorecard",
+        lambda: build_scorecard(history, history_status, scoring_candles, now.date()),
+        {"status": "unavailable"},
+    )
+    print(f"\n[*] Scorecard: {summary_line(scorecard)}")
+
     explanations = {}
     explainer_cfg = config.get("explainer", {})
     if ranked and explainer_cfg.get("enabled", True):
@@ -331,6 +348,7 @@ def main():
         economic_calendar=config.get("economic_calendar") or [],
         earnings=earnings,
         explanations=explanations,
+        scorecard=scorecard,
     )
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     stem = os.path.join(OUTPUT_DIR, f"premarket_{now:%Y-%m-%d}")
@@ -376,6 +394,17 @@ def main():
     sent = dispatcher.send(subject, html_body, text_body, attachments=[pdf_path] if pdf_path else [])
     if not sent:
         sys.exit(1)  # fails the GitHub Actions run, which notifies the repo owner
+
+    # Only a real, successful send is logged; the workflow appends these rows to the history
+    # branch afterwards. The email has already gone out, so a failure here is just a warning.
+    try:
+        benchmark = "QQQ" if "QQQ" in market else "SPY"
+        logged = write_pending(
+            alert_rows(ranked, results, market, now.date(), benchmark), history, PENDING_FILE
+        )
+        print(f"[✓] {logged} header alert(s) queued for the history log: {PENDING_FILE}")
+    except Exception as e:
+        print(f"[WARN] Couldn't queue today's alerts for the history log: {e}")
 
     print("\n[✓] Pipeline execution finished.")
 

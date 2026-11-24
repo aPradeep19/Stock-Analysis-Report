@@ -11,10 +11,12 @@ Turns analyzer output into the email: HTML body, plain-text twin and subject lin
 """
 
 import html
+import re
 from collections import Counter
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from src import scorecard as scorecard_text
 from src.analyzer import (
     DAYS_TO_COVER_LEVELS,
     PUT_CALL_LEVELS,
@@ -37,6 +39,8 @@ CARD_BG = "#ffffff"
 UP_TEXT = "#006300"  # darker than a typical "up" green so it stays legible as text
 DOWN_TEXT = "#d03b3b"
 CAUTION = "#fab219"
+# Ticker links (watchlist table, flagged stocks): a blue dark enough to read as text on white.
+LINK = "#1c5db8"
 
 TONE = {
     "down": {"color": DOWN_TEXT, "arrow": "▼", "label": "Down"},
@@ -48,6 +52,22 @@ TONE = {
 # "Segoe UI" is deliberately unquoted: this string is dropped into style='...' attributes, where
 # a quote would close the attribute early. Unquoted multi-word font names are still valid CSS.
 WHATS_MOVING_LABEL = "What's moving it:"
+
+# Jump links: tickers in the summary sections point at each stock's own section/page, and each
+# stock points back at the watchlist table. Shared by the email and the PDF.
+WATCHLIST_ANCHOR = "watchlist"
+
+
+def anchor_id(symbol):
+    """In-document anchor for a stock's section, safe for HTML ids and PDF names: 'BRK.B' -> 'stock-BRK-B'."""
+    return "stock-" + re.sub(r"[^A-Za-z0-9]+", "-", symbol or "")
+
+
+def html_ticker_link(symbol):
+    """The ticker as a link to its section further down the email. Some mail apps (notably Gmail)
+    drop in-email jump links; there it simply reads as the ticker."""
+    return f"<a href='#{anchor_id(symbol)}' style='color:{LINK};text-decoration:none;'>{e(symbol)}</a>"
+
 
 FONT = "-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif"
 
@@ -238,6 +258,7 @@ class ReportFormatter:
         economic_calendar: list = None,
         earnings: dict = None,
         explanations: dict = None,
+        scorecard: dict = None,
     ) -> dict:
         """
         Everything the renderers need. Stocks whose analysis failed are split into 'errors' so
@@ -294,6 +315,7 @@ class ReportFormatter:
             "movers": movers or {},
             "economic_events": todays_releases(economic_calendar, generated_at.date()),
             "earnings_week": earnings_this_week(earnings, generated_at.date()),
+            "scorecard": scorecard or {"status": "none"},
             "thresholds": self.thresholds,
             "news_per_stock": self.news_per_stock,
         }
@@ -339,6 +361,7 @@ class ReportFormatter:
             self._html_market(ctx),
             self._html_headline_alerts(ctx),
             self._html_glance_table(ctx),
+            self._html_scorecard(ctx),
             "".join(self._html_stock(stock, ctx) for stock in ctx["stocks"]),
             self._html_movers(ctx),
             self._html_positioning_guide(),
@@ -494,7 +517,7 @@ class ReportFormatter:
             alerts = "".join(f"<li style='margin:3px 0;'>{e(a['text'])}</li>" for a in item["alerts"])
             rows.append(
                 f"<tr><td style='border-left:4px solid {tone['color']};padding:8px 0 8px 12px;'>"
-                f"<div style='font-size:15px;font-weight:600;'>{e(item['symbol'])}{name}"
+                f"<div style='font-size:15px;font-weight:600;'>{html_ticker_link(item['symbol'])}{name}"
                 f"<span style='float:right;font-size:13px;font-weight:400;'>{gap_html}</span></div>"
                 f"<div style='font-size:12px;color:{tone['color']};font-weight:600;margin-top:2px;'>"
                 f"{tone['arrow']} {tone['label']}</div>"
@@ -537,7 +560,7 @@ class ReportFormatter:
                 else ""
             )
             cells = [
-                f"<td style='{td_style}text-align:left;font-weight:600;'>{e(stock['symbol'])}</td>",
+                f"<td style='{td_style}text-align:left;font-weight:600;'>{html_ticker_link(stock['symbol'])}</td>",
                 f"<td style='{td_style}'>{fmt_money(m.get('premarket_price'))}</td>",
                 f"<td style='{td_style}color:{pct_color(m.get('gap_pct'))};font-weight:600;'>{fmt_pct(m.get('gap_pct'))}</td>",
                 f"<td style='{td_style}color:{pct_color(m.get('last_session_pct'))};'>{fmt_pct(m.get('last_session_pct'))}</td>",
@@ -551,7 +574,10 @@ class ReportFormatter:
                 f"<td colspan='5' style='{td_style}text-align:left;color:{INK_2};'>{e(err['error'])}</td></tr>"
             )
         inner = (
-            self._h2("Watchlist at a glance", f"Gap = {ctx['labels']['gap_note']} · bold = past a threshold")
+            f"<a name='{WATCHLIST_ANCHOR}' id='{WATCHLIST_ANCHOR}'></a>"
+            + self._h2(
+                "Watchlist at a glance", f"Gap = {ctx['labels']['gap_note']} · bold = past a threshold"
+            )
             + "<div style='overflow-x:auto;'>"
             f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0' style='border-collapse:collapse;'>"
             f"<tr>{head}</tr>{''.join(rows)}</table></div>"
@@ -709,10 +735,13 @@ class ReportFormatter:
 
         inner = (
             f"<div style='overflow:hidden;'>{price_line}"
+            f"<a name='{anchor_id(stock['symbol'])}' id='{anchor_id(stock['symbol'])}'></a>"
             f"<div style='font-size:20px;font-weight:600;'>{e(stock['symbol'])}</div>{name_line}</div>"
             f"{self._html_why(stock, label=WHATS_MOVING_LABEL)}"
             f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0' style='margin-top:12px;border-collapse:collapse;'>{metric_rows}</table>"
             f"{alerts_html}{news_html}"
+            f"<div style='font-size:12px;margin-top:12px;'><a href='#{WATCHLIST_ANCHOR}' "
+            f"style='color:{LINK};text-decoration:none;'>Back to watchlist</a></div>"
         )
         # Ignored by mail clients, but printing the saved HTML preview starts each stock on a new page.
         return self._card(inner, extra_style="page-break-before:always;")
@@ -859,6 +888,100 @@ class ReportFormatter:
     # ------------------------------------------------------------------ #
     # Plain-text twin: for clients that block HTML, and it helps spam scoring
     # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    # Yesterday's scorecard (src/scorecard.py builds it; these only lay it out)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def scorecard_table(card):
+        """Header and rows of the scorecard table, as plain strings for every renderer."""
+        bench = card["benchmark"]["name"]
+        header = ["Ticker", "Alert", "Flagged at", "Close", "Held", "Follow-through", f"vs. {bench}"]
+        rows = [
+            [
+                r["symbol"],
+                f"{r['kind_label']} ({'up' if r['direction'] == 'up' else 'down'})",
+                fmt_money(r["price"]),
+                fmt_money(r["close"]),
+                "—" if r["held"] is None else ("Yes" if r["held"] else "No"),
+                fmt_pct(r["follow_pct"]),
+                fmt_pct(r["vs_bench_pct"]),
+            ]
+            for r in card["rows"]
+        ]
+        return header, rows
+
+    @staticmethod
+    def hit_rate_table(card):
+        bench = card["benchmark"]["name"]
+        header = ["Alert type", "Scored", "Held", "Avg follow-through", f"Avg vs. {bench}"]
+        rows = [
+            [
+                h["kind"],
+                str(h["scored"]),
+                fmt_pct(h["held_pct"], signed=False, decimals=0),
+                fmt_pct(h["avg_follow"]),
+                fmt_pct(h["avg_vs_bench"]),
+            ]
+            for h in card["hit_rates"] or []
+        ]
+        return header, rows
+
+    def _html_table(self, header, rows):
+        th = (
+            f"font-size:11px;font-weight:600;color:{INK_2};text-align:right;padding:5px 4px;"
+            f"border-bottom:1px solid {HAIRLINE};white-space:nowrap;"
+        )
+        td = f"font-size:13px;text-align:right;padding:6px 4px;border-bottom:1px solid {HAIRLINE};white-space:nowrap;"
+        left = "text-align:left;"
+        head = "".join(f"<th style='{th}{left if i < 2 else ''}'>{e(h)}</th>" for i, h in enumerate(header))
+        body = "".join(
+            "<tr>"
+            + "".join(f"<td style='{td}{left if i < 2 else ''}'>{e(c)}</td>" for i, c in enumerate(row))
+            + "</tr>"
+            for row in rows
+        )
+        return (
+            "<div style='overflow-x:auto;margin-top:8px;'><table role='presentation' width='100%' "
+            f"cellpadding='0' cellspacing='0' style='border-collapse:collapse;'><tr>{head}</tr>{body}</table></div>"
+        )
+
+    def _html_scorecard(self, ctx):
+        card = ctx["scorecard"]
+        inner = self._h2("Yesterday's scorecard") + (
+            f"<div style='font-size:14px;'>{e(scorecard_text.summary_line(card))}</div>"
+        )
+        if card.get("status") == "ok":
+            if card["rows"]:
+                inner += self._html_table(*self.scorecard_table(card))
+            for item in card["earnings"]:
+                inner += f"<div style='font-size:13px;margin-top:8px;'>{e(scorecard_text.earnings_line(item))}</div>"
+            if card["hit_rates"]:
+                inner += (
+                    f"<div style='font-size:13px;font-weight:600;margin-top:14px;'>Hit rates over "
+                    f"{card['days_logged']} report days</div>" + self._html_table(*self.hit_rate_table(card))
+                )
+            inner += f"<div style='font-size:12px;color:{INK_2};margin-top:10px;'>{e(scorecard_text.footnote(card))}</div>"
+        return self._card(inner)
+
+    def _text_scorecard(self, ctx):
+        card = ctx["scorecard"]
+        lines = ["YESTERDAY'S SCORECARD", f"  {scorecard_text.summary_line(card)}"]
+        if card.get("status") == "ok":
+            header, rows = self.scorecard_table(card)
+            widths = [7, 22, 11, 11, 5, 15, 13]
+            if rows:
+                lines.append("  " + "".join(f"{h:<{w}}" for h, w in zip(header, widths)))
+                lines += ["  " + "".join(f"{c:<{w}}" for c, w in zip(row, widths)) for row in rows]
+            lines += [f"  {scorecard_text.earnings_line(item)}" for item in card["earnings"]]
+            if card["hit_rates"]:
+                lines.append(f"  Hit rates over {card['days_logged']} report days:")
+                header, rows = self.hit_rate_table(card)
+                widths = [18, 8, 7, 20, 14]
+                lines.append("    " + "".join(f"{h:<{w}}" for h, w in zip(header, widths)))
+                lines += ["    " + "".join(f"{c:<{w}}" for c, w in zip(row, widths)) for row in rows]
+            lines.append(f"  {scorecard_text.footnote(card)}")
+        return lines + [""]
+
     def _text_why(self, item, indent):
         parts = self.why_parts(item)
         if not parts:
@@ -920,6 +1043,7 @@ class ReportFormatter:
         for err in ctx["errors"]:
             lines.append(f"  {err['symbol']:<7}{err['error']}")
         lines.append("")
+        lines += self._text_scorecard(ctx)
 
         for stock in ctx["stocks"]:
             lines.append(f"{stock['symbol']} — {stock['metrics'].get('name') or ''}".rstrip(" —"))

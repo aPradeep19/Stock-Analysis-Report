@@ -250,3 +250,56 @@ def sample_movers():
         "day_losers": [{"symbol": "LLL", "change_pct": -15.1}, {"symbol": "MMM", "change_pct": -9.8}],
         "most_actives": [{"symbol": "NNN", "change_pct": 1.2}, {"symbol": "OOO", "change_pct": -2.4}],
     }
+
+
+def stress_scorecard(ranked):
+    """A scorecard at its fullest: a scored row per ranked alert, earnings and hit rates."""
+    rows = [
+        {
+            "symbol": item["symbol"],
+            "kind": "move",
+            "kind_label": "Price move",
+            "direction": "down" if i % 2 else "up",
+            "severity": 2.0 - i * 0.1,
+            "text": "synthetic",
+            "price": 100.0 + i,
+            "base": 99.0 + i,
+            "close": 101.5 + i,
+            "held": i % 3 != 0,
+            "follow_pct": 1.2 - i * 0.3,
+            "vs_bench_pct": 0.4 - i * 0.2,
+        }
+        for i, item in enumerate(ranked)
+    ]
+    kinds = ["Price move", "Volume", "Moving average", "52-week high/low", "MACD"]
+    return {
+        "status": "ok",
+        "date": "2026-09-30",
+        "rows": rows,
+        "skipped": 1,
+        "summary": {"scored": len(rows), "held": len(rows) - 2, "avg_follow": 0.6, "avg_vs_bench": 0.2},
+        "benchmark": {"symbol": "QQQ", "name": "Nasdaq"},
+        "earnings": [
+            {
+                "symbol": "AAA",
+                "event_date": "2026-09-29",
+                "hour": "amc",
+                "move_pct": 8.1,
+                "typical_pct": 2.4,
+                "multiple": 3.4,
+            },
+            {
+                "symbol": "BBB",
+                "event_date": "2026-09-30",
+                "hour": "bmo",
+                "move_pct": -5.2,
+                "typical_pct": 3.0,
+                "multiple": 1.7,
+            },
+        ],
+        "hit_rates": [
+            {"kind": k, "scored": 40 - i * 5, "held_pct": 60.0 + i, "avg_follow": 0.4, "avg_vs_bench": 0.1}
+            for i, k in enumerate(kinds)
+        ],
+        "days_logged": 23,
+    }

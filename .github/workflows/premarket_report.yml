@@ -106,7 +106,23 @@ jobs:
             echo "Already past 7:00 AM Central (or >1h early); running now"
           fi
 
+      # Yesterday's scorecard reads the alert log kept on the "history" branch. The first
+      # successful send creates that branch, so it may not exist yet. Nothing here can block the
+      # email: on any problem the report just says the history is unavailable.
+      - name: Fetch the alert history
+        continue-on-error: true
+        run: |
+          mkdir -p history
+          if git ls-remote --exit-code --heads origin history > /dev/null; then
+            git fetch -q --depth=1 origin history
+            git show FETCH_HEAD:alerts.jsonl > history/alerts.jsonl
+            echo "Fetched $(wc -l < history/alerts.jsonl) logged alerts"
+          else
+            echo "No history branch yet (first run): the scorecard will say there's nothing to score"
+          fi
+
       - name: Build and send the report
+        id: send
         env:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -148,6 +164,35 @@ jobs:
               -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
               commit -q -m "$MSG"
           git push -q -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" reports
+
+      # Logs today's header alerts for tomorrow's scorecard (main.py queues them only after a real,
+      # successful send). This runs after the publish step on purpose: that step's commit is the
+      # gate's "already sent today" marker, so a failure here can never cause a second email. It
+      # isn't continue-on-error, so a failed push fails the run and GitHub emails you about it.
+      # The branch is append-only: plain pushes, never force.
+      - name: Append today's alerts to the history branch
+        if: always() && steps.send.outcome == 'success' && inputs.dry_run != true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PENDING="$PWD/output/alerts_pending.jsonl"
+          if [ ! -s "$PENDING" ]; then
+            echo "No new alerts to log today"
+            exit 0
+          fi
+          URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          DIR="$RUNNER_TEMP/history"
+          if git ls-remote --exit-code --heads "$URL" history > /dev/null; then
+            git clone -q --depth 1 --branch history "$URL" "$DIR"
+          else
+            git init -q -b history "$DIR"  # first run: start the branch
+          fi
+          cat "$PENDING" >> "$DIR/alerts.jsonl"
+          cd "$DIR"
+          git add alerts.jsonl
+          git -c user.name="github-actions[bot]"               -c user.email="41898282+github-actions[bot]@users.noreply.github.com"               commit -q -m "Alerts for $(TZ=America/Chicago date +%F)"
+          git push -q "$URL" HEAD:history
+          echo "Logged $(wc -l < "$PENDING") alert(s); history now has $(wc -l < alerts.jsonl)"
 
       # Keeps each day's HTML/PDF for 14 days under the run's "Artifacts" section
       - uses: actions/upload-artifact@v5
