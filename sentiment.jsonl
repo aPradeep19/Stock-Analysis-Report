@@ -1,0 +1,11 @@
+{"date": "2026-11-25", "symbol": "NBIS", "score": 0.117, "label": "Mixed", "relevant": 3, "session": "pre-market", "last_close": 87.31, "price": 80.3}
+{"date": "2026-11-25", "symbol": "MRVL", "score": -0.795, "label": "Bearish", "relevant": 2, "session": "pre-market", "last_close": 131.57, "price": 123.27}
+{"date": "2026-11-25", "symbol": "NVDA", "score": -0.197, "label": "Mixed", "relevant": 6, "session": "pre-market", "last_close": 155.38, "price": 146.6}
+{"date": "2026-11-25", "symbol": "SNDK", "score": -0.7, "label": "Bearish", "relevant": 4, "session": "pre-market", "last_close": 94.395, "price": 71.22}
+{"date": "2026-11-25", "symbol": "MU", "score": -0.428, "label": "Bearish", "relevant": 7, "session": "pre-market", "last_close": 629.79, "price": 574.8902}
+{"date": "2026-11-25", "symbol": "SLS", "score": -0.0, "label": "Mixed", "relevant": 10, "session": "pre-market", "last_close": 13.25, "price": 12.8}
+{"date": "2026-11-25", "symbol": "RDDT", "score": 0.253, "label": "Bullish", "relevant": 6, "session": "pre-market", "last_close": 90.34, "price": 86.4}
+{"date": "2026-11-25", "symbol": "RZLV", "score": 0.802, "label": "Bullish", "relevant": 4, "session": "pre-market", "last_close": 0.866, "price": 0.84}
+{"date": "2026-11-25", "symbol": "NOW", "score": 0.553, "label": "Bullish", "relevant": 3, "session": "pre-market", "last_close": 91.74, "price": 88.88}
+{"date": "2026-11-25", "symbol": "GOOGL", "score": -0.027, "label": "Neutral", "relevant": 3, "session": "pre-market", "last_close": 279.05, "price": 264.35}
+{"date": "2026-11-25", "symbol": "GEV", "score": 0.186, "label": "Mixed", "relevant": 3, "session": "pre-market", "last_close": 720.65, "price": 689.92}
